@@ -16,6 +16,11 @@ Le programme découvre les hôtes IPv4 du réseau local avec des requêtes ARP.
    `update` détecte `/etc/os-release` sur chaque hôte et utilise
    `apt-get` pour Debian/Ubuntu ou `pacman` pour Arch. Une distribution
    inconnue est signalée sans exécuter de commande.
+   Chaque mise à jour est lancée dans une session `tmux` distante nommée
+   `nsimaj-update`, afin de continuer même si la connexion SSH est coupée.
+   `tmux` est installé automatiquement par SSH s'il est absent :
+   `apt-get install -y tmux` sur Debian/Ubuntu ou
+   `pacman -Sy --noconfirm tmux` sur Arch.
    Les commandes sont lancées en parallèle et restent en arrière-plan.
    Les logs sont silencieux par défaut : seuls les succès et échecs sont
    annoncés. `focus <ip>` affiche les logs d'une machine et lui transmet

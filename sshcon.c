@@ -23,8 +23,10 @@ static const char update_command[] =
     ". /etc/os-release 2>/dev/null || { echo 'cannot detect distribution' >&2; exit 64; }; "
     "case \" $ID $ID_LIKE \" in "
     "*' debian '*|*' ubuntu '*|*' linuxmint '*) "
+    "command -v tmux >/dev/null || { apt-get update && apt-get install -y tmux; }; "
     "apt-get update && apt-get -y upgrade;; "
     "*' arch '*|*' manjaro '*|*' endeavouros '*) "
+    "command -v tmux >/dev/null || pacman -Sy --noconfirm tmux; "
     "pacman -Syu --noconfirm;; "
     "*) echo \"unsupported distribution: ${ID:-unknown}\" >&2; exit 64;; "
     "esac";
@@ -145,6 +147,19 @@ static void sudo_command(char *out, size_t size, const char *command)
         snprintf(out + used, size - used, "'");
 }
 
+static void shell_quote(char *out, size_t size, const char *value)
+{
+    size_t used = (size_t)snprintf(out, size, "'");
+    for (size_t i = 0; value[i] && used + 5 < size; i++) {
+        if (value[i] == '\'')
+            used += (size_t)snprintf(out + used, size - used, "'\\''");
+        else
+            out[used++] = value[i];
+    }
+    if (used < size)
+        snprintf(out + used, size - used, "'");
+}
+
 struct job {
     pid_t pid;
     int fd, active;
@@ -168,7 +183,7 @@ static int start_ssh(const struct config *config, const struct host *host,
                      const char *command, int sudo, struct job *job)
 {
     char ip[INET_ADDRSTRLEN], target[VALUE_SIZE + INET_ADDRSTRLEN + 2];
-    char remote_command[COMMAND_SIZE * 2];
+    char remote_command[COMMAND_SIZE * 2], tmux_command[COMMAND_SIZE * 4];
     if (!inet_ntop(AF_INET, &host->ip, ip, sizeof ip))
         return -1;
     snprintf(target, sizeof target, "%s@%s", config->user, ip);
@@ -215,10 +230,30 @@ static int start_ssh(const struct config *config, const struct host *host,
         setenv("SSHPASS", config->ssh_password, 1);
         const char *remote = command;
         if (sudo) {
-            sudo_command(remote_command, sizeof remote_command, command);
+            char quoted[COMMAND_SIZE * 2];
+            shell_quote(quoted, sizeof quoted, command);
+            snprintf(tmux_command, sizeof tmux_command,
+                     ". /etc/os-release 2>/dev/null || exit 64; "
+                     "command -v tmux >/dev/null || "
+                     "case \" $ID $ID_LIKE \" in "
+                     "*' debian '*|*' ubuntu '*|*' linuxmint '*) "
+                     "apt-get update && apt-get install -y tmux;; "
+                     "*' arch '*|*' manjaro '*|*' endeavouros '*) "
+                     "pacman -Sy --noconfirm tmux;; "
+                     "*) echo \"unsupported distribution: ${ID:-unknown}\" "
+                     ">&2; exit 64;; esac; "
+                     "tmux kill-session -t nsimaj-update 2>/dev/null || true; "
+                     "tmux new-session -s nsimaj-update -- sh -c %s", quoted);
+            sudo_command(remote_command, sizeof remote_command, tmux_command);
             remote = remote_command;
         }
-        execlp("sshpass", "sshpass", "-e", "ssh", "-o", "ConnectTimeout=5",
+        if (sudo)
+            execlp("sshpass", "sshpass", "-e", "ssh", "-tt",
+                   "-o", "ConnectTimeout=5",
+                   "-o", "StrictHostKeyChecking=accept-new",
+                   target, remote, (char *)NULL);
+        else
+            execlp("sshpass", "sshpass", "-e", "ssh", "-o", "ConnectTimeout=5",
                "-o", "StrictHostKeyChecking=accept-new",
                target, remote, (char *)NULL);
         perror("sshpass");

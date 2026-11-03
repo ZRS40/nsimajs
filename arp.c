@@ -12,7 +12,8 @@
 #include <sys/socket.h>
 #include <time.h>
 
-#define ARP_TIMEOUT 2000
+#define ARP_TIMEOUT 4000
+#define ARP_PASSES 2
 
 struct arp_packet {
     uint16_t htype, ptype;
@@ -70,12 +71,13 @@ int arp_scan(int fd, const struct network *net, struct hosts *hosts)
         free(hosts->items);
         return -1;
     }
-    struct timespec delay = {0, 1000000};
-    for (uint32_t i = network + 1; i < broadcast; i++) {
-        if (i != ip && send_request(fd, net, htonl(i)) < 0)
-            perror("sendto");
-        nanosleep(&delay, NULL);
-    }
+    struct timespec delay = {0, 2000000};
+    for (int pass = 0; pass < ARP_PASSES; pass++)
+        for (uint32_t i = network + 1; i < broadcast; i++) {
+            if (i != ip && send_request(fd, net, htonl(i)) < 0)
+                perror("sendto");
+            nanosleep(&delay, NULL);
+        }
 
     struct pollfd pfd = {.fd = fd, .events = POLLIN};
     puts("Waiting for responses...");
