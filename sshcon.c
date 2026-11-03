@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
+#include <termios.h>
 #include <unistd.h>
 
 #define COMMAND_SIZE 1024
@@ -147,17 +148,20 @@ static void sudo_command(char *out, size_t size, const char *command)
 struct job {
     pid_t pid;
     int fd, active;
+    int status, started;
     char ip[INET_ADDRSTRLEN];
     FILE *log;
 };
 
 static volatile sig_atomic_t focused_pid;
+static volatile sig_atomic_t interrupted;
 
 static void interrupt_focused(int signal_number)
 {
     (void)signal_number;
     if (focused_pid > 0)
         kill(-focused_pid, SIGINT);
+    interrupted = 1;
 }
 
 static int start_ssh(const struct config *config, const struct host *host,
@@ -179,11 +183,6 @@ static int start_ssh(const struct config *config, const struct host *host,
         perror("pipe");
         close(output[0]);
         close(output[1]);
-        if (fcntl(output[0], F_SETFL, O_NONBLOCK) < 0) {
-            perror("fcntl");
-            close(output[0]);
-            return -1;
-        }
         return -1;
     }
     char path[PATH_MAX];
@@ -226,16 +225,21 @@ static int start_ssh(const struct config *config, const struct host *host,
         _exit(127);
     }
     close(output[1]);
+    if (fcntl(output[0], F_SETFL, O_NONBLOCK) < 0) {
+        perror("fcntl");
+        close(output[0]);
+        return -1;
+    }
     if (sudo) {
         close(input[0]);
         dprintf(input[1], "%s\n", config->sudo_password);
         close(input[1]);
     }
     if (log)
-        fprintf(log, "\n[%s] command: %s\n", ip, command);
     job->pid = pid;
     job->fd = output[0];
     job->active = 1;
+    job->started = 1;
     job->log = log;
     snprintf(job->ip, sizeof job->ip, "%s", ip);
     if (log)
@@ -251,24 +255,31 @@ static int job_count(struct job *jobs, size_t count)
     return active;
 }
 
-static void pump_jobs(struct job *jobs, size_t count, const char *watch,
-                      int timeout)
+static int pump_jobs(struct job *jobs, size_t count, const char *watch,
+                     int timeout)
 {
     struct pollfd *fds = calloc(count, sizeof *fds);
-    if (!fds)
-        return;
+    size_t *indexes = calloc(count, sizeof *indexes);
+    if (!fds || !indexes) {
+        free(fds);
+        free(indexes);
+        return 0;
+    }
+    int completed = 0;
     for (;;) {
         size_t used = 0;
         for (size_t i = 0; i < count; i++)
             if (jobs[i].active) {
                 fds[used].fd = jobs[i].fd;
                 fds[used++].events = POLLIN;
+                indexes[used - 1] = i;
             }
         if (!used || poll(fds, used, timeout) <= 0)
             break;
-        for (size_t i = 0; i < count; i++) {
-            if (!jobs[i].active)
+        for (size_t n = 0; n < used; n++) {
+            if (!(fds[n].revents & (POLLIN | POLLHUP | POLLERR)))
                 continue;
+            size_t i = indexes[n];
             char buffer[512];
             ssize_t length = read(jobs[i].fd, buffer, sizeof buffer);
             if (length > 0) {
@@ -279,26 +290,39 @@ static void pump_jobs(struct job *jobs, size_t count, const char *watch,
                 if (jobs[i].log)
                     fflush(jobs[i].log);
                 fflush(stdout);
+            } else if (length < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                continue;
             } else if (!length) {
                 int status;
                 close(jobs[i].fd);
-                waitpid(jobs[i].pid, &status, 0);
+                while (waitpid(jobs[i].pid, &status, 0) < 0 &&
+                       errno == EINTR)
+                    ;
                 jobs[i].active = 0;
+                completed++;
                 if (jobs[i].log) {
                     int result = WIFEXITED(status) ? WEXITSTATUS(status) :
                                  128 + WTERMSIG(status);
+                    jobs[i].status = result;
                     fprintf(jobs[i].log, "[%s] exit status: %d\n",
                             jobs[i].ip, result);
                     fclose(jobs[i].log);
                 }
                 int result = WIFEXITED(status) ? WEXITSTATUS(status) :
                              128 + WTERMSIG(status);
-                printf("[%s] %s (status %d)\n", jobs[i].ip,
-                       result ? "failed" : "completed", result);
+                if (interrupted && !strcmp(watch, jobs[i].ip)) {
+                    printf("\n[%s] stopped by Ctrl+C\n", jobs[i].ip);
+                    interrupted = 0;
+                } else {
+                    printf("\n[%s] %s (status %d)\n", jobs[i].ip,
+                           result ? "failed" : "completed", result);
+                }
             }
         }
     }
     free(fds);
+    free(indexes);
+    return completed;
 }
 
 static void start_all(const struct config *config, const struct hosts *hosts,
@@ -326,6 +350,53 @@ static void show_log(const char *ip)
     printf("--- live output: %s ---\n", ip);
 }
 
+static int read_command(char *line, size_t size, char *history)
+{
+    struct termios original, raw;
+    if (tcgetattr(STDIN_FILENO, &original) < 0)
+        return fgets(line, (int)size, stdin) ? 0 : -1;
+    raw = original;
+    raw.c_lflag &= (tcflag_t)~(ICANON | ECHO);
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) < 0)
+        return -1;
+    size_t length = 0;
+    line[0] = '\0';
+    for (;;) {
+        unsigned char character;
+        if (read(STDIN_FILENO, &character, 1) != 1)
+            break;
+        if (character == '\n' || character == '\r') {
+            putchar('\n');
+            break;
+        }
+        if (character == 127 || character == '\b') {
+            if (length) {
+                line[--length] = '\0';
+                fputs("\b \b", stdout);
+            }
+        } else if (character == 27) {
+            unsigned char sequence[2];
+            if (read(STDIN_FILENO, sequence, 2) == 2 &&
+                sequence[0] == '[' && sequence[1] == 'A' && *history) {
+                while (length)
+                    fputs("\b \b", stdout), line[--length] = '\0';
+                snprintf(line, size, "%s", history);
+                length = strlen(line);
+                fputs(line, stdout);
+            }
+        } else if (length + 1 < size) {
+            line[length++] = (char)character;
+            line[length] = '\0';
+            putchar(character);
+        }
+        fflush(stdout);
+    }
+    tcsetattr(STDIN_FILENO, TCSANOW, &original);
+    if (line[0])
+        snprintf(history, COMMAND_SIZE, "%s", line);
+    return 0;
+}
+
 void ssh_console(const struct hosts *hosts)
 {
     if (!hosts->count) {
@@ -333,7 +404,7 @@ void ssh_console(const struct hosts *hosts)
         return;
     }
     struct config config = {0};
-    char input[COMMAND_SIZE], user_buffer[64];
+    char input[COMMAND_SIZE], history[COMMAND_SIZE] = "", user_buffer[64];
     load_config(&config);
     if (!*config.user) {
         int character;
@@ -364,7 +435,8 @@ void ssh_console(const struct hosts *hosts)
     signal(SIGINT, interrupt_focused);
     puts("\nSSH console: update | exec <command> | focus <ip> | back | jobs | quit");
     for (;;) {
-        pump_jobs(jobs, hosts->count, watch, 100);
+        if (pump_jobs(jobs, hosts->count, watch, 100))
+            prompt = 1;
         if (prompt) {
             printf("ssh[%s]> ", watch);
             fflush(stdout);
@@ -373,7 +445,7 @@ void ssh_console(const struct hosts *hosts)
         struct pollfd input_poll = {.fd = STDIN_FILENO, .events = POLLIN};
         if (poll(&input_poll, 1, 100) <= 0)
             continue;
-        if (!fgets(input, sizeof input, stdin)) {
+        if (read_command(input, sizeof input, history) < 0) {
             while (job_count(jobs, hosts->count))
                 pump_jobs(jobs, hosts->count, watch, 100);
             break;
@@ -393,9 +465,16 @@ void ssh_console(const struct hosts *hosts)
             puts("back         hide logs and stop focusing a host");
             puts("quit         leave the console");
         } else if (!strcmp(input, "jobs")) {
-            for (size_t i = 0; i < hosts->count; i++)
-                if (jobs[i].active)
+            for (size_t i = 0; i < hosts->count; i++) {
+                if (!jobs[i].started)
+                    printf("%s idle\n", jobs[i].ip);
+                else if (jobs[i].active)
                     printf("%s running (pid %d)\n", jobs[i].ip, jobs[i].pid);
+                else
+                    printf("%s %s (status %d)\n", jobs[i].ip,
+                           jobs[i].status ? "failed" : "completed",
+                           jobs[i].status);
+            }
         } else if (!strncmp(input, "focus ", 6) &&
                    (!strcmp(input + 6, "all") ||
                     (strlen(input + 6) < sizeof watch &&
