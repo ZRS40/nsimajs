@@ -6,6 +6,8 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <pwd.h>
+#include <poll.h>
+#include <signal.h>
 #include <sys/stat.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -50,13 +52,14 @@ static int config_path(char *path, size_t size)
         ? 0 : -1;
 }
 
-static int log_path(char *path, size_t size)
+static int log_path(char *path, size_t size, const char *ip)
 {
     if (config_path(path, size) < 0)
         return -1;
     char *name = strrchr(path, '/');
     if (!name || (size_t)snprintf(name, size - (size_t)(name - path),
-                                  "ssh.log") >= size - (size_t)(name - path))
+                                  "ssh-%s.log", ip) >=
+                     size - (size_t)(name - path))
         return -1;
     return 0;
 }
@@ -141,8 +144,24 @@ static void sudo_command(char *out, size_t size, const char *command)
         snprintf(out + used, size - used, "'");
 }
 
-static int run_ssh(const struct config *config, const struct host *host,
-                   const char *command, int sudo)
+struct job {
+    pid_t pid;
+    int fd, active;
+    char ip[INET_ADDRSTRLEN];
+    FILE *log;
+};
+
+static volatile sig_atomic_t focused_pid;
+
+static void interrupt_focused(int signal_number)
+{
+    (void)signal_number;
+    if (focused_pid > 0)
+        kill(-focused_pid, SIGINT);
+}
+
+static int start_ssh(const struct config *config, const struct host *host,
+                     const char *command, int sudo, struct job *job)
 {
     char ip[INET_ADDRSTRLEN], target[VALUE_SIZE + INET_ADDRSTRLEN + 2];
     char remote_command[COMMAND_SIZE * 2];
@@ -150,27 +169,32 @@ static int run_ssh(const struct config *config, const struct host *host,
         return -1;
     snprintf(target, sizeof target, "%s@%s", config->user, ip);
 
-    int errors[2];
-    if (pipe(errors) < 0) {
+    int output[2];
+    if (pipe(output) < 0) {
         perror("pipe");
         return -1;
     }
     int input[2] = {-1, -1};
     if (sudo && pipe(input) < 0) {
         perror("pipe");
-        close(errors[0]);
-        close(errors[1]);
+        close(output[0]);
+        close(output[1]);
+        if (fcntl(output[0], F_SETFL, O_NONBLOCK) < 0) {
+            perror("fcntl");
+            close(output[0]);
+            return -1;
+        }
         return -1;
     }
     char path[PATH_MAX];
     FILE *log = NULL;
-    if (log_path(path, sizeof path) == 0)
+    if (log_path(path, sizeof path, ip) == 0)
         log = fopen(path, "a");
     pid_t pid = fork();
     if (pid < 0) {
         perror("fork");
-        close(errors[0]);
-        close(errors[1]);
+        close(output[0]);
+        close(output[1]);
         if (sudo)
             close(input[0]), close(input[1]);
         if (log)
@@ -178,14 +202,17 @@ static int run_ssh(const struct config *config, const struct host *host,
         return -1;
     }
     if (!pid) {
-        dup2(errors[1], STDERR_FILENO);
-        close(errors[0]);
-        close(errors[1]);
+        setpgid(0, 0);
+        dup2(output[1], STDOUT_FILENO);
+        dup2(output[1], STDERR_FILENO);
+        close(output[0]);
+        close(output[1]);
         if (sudo) {
             dup2(input[0], STDIN_FILENO);
             close(input[0]);
             close(input[1]);
         }
+        setpgid(pid, pid);
         setenv("SSHPASS", config->ssh_password, 1);
         const char *remote = command;
         if (sudo) {
@@ -198,7 +225,7 @@ static int run_ssh(const struct config *config, const struct host *host,
         perror("sshpass");
         _exit(127);
     }
-    close(errors[1]);
+    close(output[1]);
     if (sudo) {
         close(input[0]);
         dprintf(input[1], "%s\n", config->sudo_password);
@@ -206,46 +233,97 @@ static int run_ssh(const struct config *config, const struct host *host,
     }
     if (log)
         fprintf(log, "\n[%s] command: %s\n", ip, command);
-    char buffer[512];
-    ssize_t length;
-    while ((length = read(errors[0], buffer, sizeof buffer)) > 0) {
-        fwrite(buffer, 1, (size_t)length, stderr);
-        if (log)
-            fwrite(buffer, 1, (size_t)length, log);
-    }
-    close(errors[0]);
-    int status;
-    while (waitpid(pid, &status, 0) < 0)
-        if (errno != EINTR) {
-            perror("waitpid");
-            return -1;
-        }
-    if (WIFEXITED(status))
-        status = WEXITSTATUS(status);
-    else
-        status = 128 + WTERMSIG(status);
-    if (log) {
-        fprintf(log, "[%s] exit status: %d\n", ip, status);
-        fclose(log);
-    }
-    if (status == 6)
-        fprintf(stderr, "[%s] sshpass status 6: host key verification failed "
-                        "or the host is unknown in known_hosts\n", ip);
-    return status;
+    job->pid = pid;
+    job->fd = output[0];
+    job->active = 1;
+    job->log = log;
+    snprintf(job->ip, sizeof job->ip, "%s", ip);
+    if (log)
+        fprintf(log, "\n[%s] command: %s\n", ip, command);
+    return 0;
 }
 
-static void run_all(const struct config *config, const struct hosts *hosts,
-                    const char *command, int sudo)
+static int job_count(struct job *jobs, size_t count)
 {
-    for (size_t i = 0; i < hosts->count; i++) {
-        char ip[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &hosts->items[i].ip, ip, sizeof ip);
-        printf("\n--- %s ---\n", ip);
-        fflush(stdout);
-        int status = run_ssh(config, &hosts->items[i], command, sudo);
-        if (status)
-            fprintf(stderr, "[%s] ssh failed (status %d)\n", ip, status);
+    int active = 0;
+    for (size_t i = 0; i < count; i++)
+        active += jobs[i].active;
+    return active;
+}
+
+static void pump_jobs(struct job *jobs, size_t count, const char *watch,
+                      int timeout)
+{
+    struct pollfd *fds = calloc(count, sizeof *fds);
+    if (!fds)
+        return;
+    for (;;) {
+        size_t used = 0;
+        for (size_t i = 0; i < count; i++)
+            if (jobs[i].active) {
+                fds[used].fd = jobs[i].fd;
+                fds[used++].events = POLLIN;
+            }
+        if (!used || poll(fds, used, timeout) <= 0)
+            break;
+        for (size_t i = 0; i < count; i++) {
+            if (!jobs[i].active)
+                continue;
+            char buffer[512];
+            ssize_t length = read(jobs[i].fd, buffer, sizeof buffer);
+            if (length > 0) {
+                if (!strcmp(watch, jobs[i].ip))
+                    printf("[%s] %.*s", jobs[i].ip, (int)length, buffer);
+                if (jobs[i].log)
+                    fwrite(buffer, 1, (size_t)length, jobs[i].log);
+                if (jobs[i].log)
+                    fflush(jobs[i].log);
+                fflush(stdout);
+            } else if (!length) {
+                int status;
+                close(jobs[i].fd);
+                waitpid(jobs[i].pid, &status, 0);
+                jobs[i].active = 0;
+                if (jobs[i].log) {
+                    int result = WIFEXITED(status) ? WEXITSTATUS(status) :
+                                 128 + WTERMSIG(status);
+                    fprintf(jobs[i].log, "[%s] exit status: %d\n",
+                            jobs[i].ip, result);
+                    fclose(jobs[i].log);
+                }
+                int result = WIFEXITED(status) ? WEXITSTATUS(status) :
+                             128 + WTERMSIG(status);
+                printf("[%s] %s (status %d)\n", jobs[i].ip,
+                       result ? "failed" : "completed", result);
+            }
+        }
     }
+    free(fds);
+}
+
+static void start_all(const struct config *config, const struct hosts *hosts,
+                      const char *command, int sudo, struct job *jobs)
+{
+    for (size_t i = 0; i < hosts->count; i++)
+        if (start_ssh(config, &hosts->items[i], command, sudo, &jobs[i]) < 0)
+            fprintf(stderr, "cannot start SSH for host %zu\n", i + 1);
+}
+
+static void show_log(const char *ip)
+{
+    char path[PATH_MAX], buffer[512];
+    if (log_path(path, sizeof path, ip) < 0)
+        return;
+    FILE *log = fopen(path, "r");
+    if (!log) {
+        printf("[%s] no log yet\n", ip);
+        return;
+    }
+    printf("\n--- existing log: %s ---\n", ip);
+    while (fgets(buffer, sizeof buffer, log))
+        fputs(buffer, stdout);
+    fclose(log);
+    printf("--- live output: %s ---\n", ip);
 }
 
 void ssh_console(const struct hosts *hosts)
@@ -278,30 +356,75 @@ void ssh_console(const struct hosts *hosts)
     if (save_config(&config) < 0)
         perror("config");
 
-    puts("\nSSH console: update | exec <command> | help | quit");
+    struct job *jobs = calloc(hosts->count, sizeof *jobs);
+    char watch[INET_ADDRSTRLEN] = "";
+    int prompt = 1;
+    if (!jobs)
+        return;
+    signal(SIGINT, interrupt_focused);
+    puts("\nSSH console: update | exec <command> | focus <ip> | back | jobs | quit");
     for (;;) {
-        fputs("ssh> ", stdout);
-        fflush(stdout);
-        if (!fgets(input, sizeof input, stdin))
+        pump_jobs(jobs, hosts->count, watch, 100);
+        if (prompt) {
+            printf("ssh[%s]> ", watch);
+            fflush(stdout);
+            prompt = 0;
+        }
+        struct pollfd input_poll = {.fd = STDIN_FILENO, .events = POLLIN};
+        if (poll(&input_poll, 1, 100) <= 0)
+            continue;
+        if (!fgets(input, sizeof input, stdin)) {
+            while (job_count(jobs, hosts->count))
+                pump_jobs(jobs, hosts->count, watch, 100);
             break;
+        }
         input[strcspn(input, "\n")] = '\0';
-        if (!strcmp(input, "quit") || !strcmp(input, "exit"))
+        prompt = 1;
+        if (!strcmp(input, "quit") || !strcmp(input, "exit")) {
+            while (job_count(jobs, hosts->count))
+                pump_jobs(jobs, hosts->count, watch, 100);
             break;
+        }
         if (!strcmp(input, "help")) {
             puts("update       update all hosts");
             puts("exec <cmd>   execute <cmd> on all hosts");
+            puts("jobs         show running SSH jobs");
+            puts("focus <ip>   show one host and route Ctrl+C to it");
+            puts("back         hide logs and stop focusing a host");
             puts("quit         leave the console");
+        } else if (!strcmp(input, "jobs")) {
+            for (size_t i = 0; i < hosts->count; i++)
+                if (jobs[i].active)
+                    printf("%s running (pid %d)\n", jobs[i].ip, jobs[i].pid);
+        } else if (!strncmp(input, "focus ", 6) &&
+                   (!strcmp(input + 6, "all") ||
+                    (strlen(input + 6) < sizeof watch &&
+                     inet_pton(AF_INET, input + 6, &(struct in_addr){0})))) {
+            if (!strcmp(input + 6, "all"))
+                watch[0] = '\0';
+            else {
+                snprintf(watch, sizeof watch, "%s", input + 6);
+                show_log(watch);
+            }
+            focused_pid = 0;
+            for (size_t i = 0; i < hosts->count; i++)
+                if (!strcmp(watch, jobs[i].ip) && jobs[i].active)
+                    focused_pid = jobs[i].pid;
+        } else if (!strcmp(input, "back")) {
+            watch[0] = '\0';
+            focused_pid = 0;
         } else if (!strcmp(input, "update")) {
             if (!*config.sudo_password &&
                 ask_value("Sudo password: ", config.sudo_password,
                           sizeof config.sudo_password) < 0)
                 continue;
             save_config(&config);
-            run_all(&config, hosts, update_command, 1);
+            start_all(&config, hosts, update_command, 1, jobs);
         } else if (!strncmp(input, "exec ", 5) && input[5]) {
-            run_all(&config, hosts, input + 5, 0);
+            start_all(&config, hosts, input + 5, 0, jobs);
         } else if (*input) {
             puts("Unknown command. Type help.");
         }
     }
+    free(jobs);
 }

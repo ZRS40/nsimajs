@@ -16,9 +16,14 @@ Le programme découvre les hôtes IPv4 du réseau local avec des requêtes ARP.
    `update` détecte `/etc/os-release` sur chaque hôte et utilise
    `apt-get` pour Debian/Ubuntu ou `pacman` pour Arch. Une distribution
    inconnue est signalée sans exécuter de commande.
-   Les connexions sont séquentielles : la sortie standard et les erreurs de
-   chaque machine restent visibles, sans `screen`.
-   Les erreurs sont aussi enregistrées dans `~/.config/nsimaj/ssh.log`.
+   Les commandes sont lancées en parallèle et restent en arrière-plan.
+   Les logs sont silencieux par défaut : seuls les succès et échecs sont
+   annoncés. `focus <ip>` affiche les logs d'une machine et lui transmet
+   `Ctrl+C`; `back` masque à nouveau les logs. Les jobs restent en arrière-plan
+   et `jobs` liste leur état, sans `screen`.
+   Les logs sont enregistrés séparément dans
+   `~/.config/nsimaj/ssh-<ip>.log`; le contenu déjà produit est affiché dès
+   qu'un job est focalisé.
 
 La connexion utilise `sshpass` et l'authentification par mot de passe.
 Le démon SSH doit déjà être actif sur les machines distantes. Les nouvelles
