@@ -107,6 +107,17 @@ int agent_job_start(struct agent_state *st, const char *job_id, const char *kind
     snprintf(log_path, sizeof log_path, "/tmp/nsimaj-log-%s", session);
     snprintf(pid_path, sizeof pid_path, "/tmp/nsimaj-pid-%s", session);
 
+    /* Truncate log for this job */
+    {
+        FILE *lf = fopen(log_path, "w");
+        if (lf)
+            fclose(lf);
+    }
+
+    int interactive_shell =
+        (strcmp(kind, JOB_KIND_EXEC) == 0 && payload &&
+         (strcmp(payload, "bash") == 0 || strcmp(payload, "sh") == 0));
+
     FILE *sf = fopen(script_path, "w");
     if (!sf) {
         send_stage(st, STAGE_FAILED, 1, "cannot write job script");
@@ -116,12 +127,16 @@ int agent_job_start(struct agent_state *st, const char *job_id, const char *kind
 
     fprintf(sf, "#!/bin/sh\n");
     fprintf(sf, "STAGE_FILE=/tmp/nsimaj-stage-%s\n", session);
-    fprintf(sf, "LOG_FILE=%s\n", log_path);
     fprintf(sf, "echo preparing > \"$STAGE_FILE\"\n");
-    fprintf(sf, ": > \"$LOG_FILE\"\n");
-    fprintf(sf, "exec >>\"$LOG_FILE\" 2>&1\n");
+    /* Do NOT exec-redirect to a log file — that makes the tmux pane black.
+     * Logging is done via tmux pipe-pane after the session starts. */
 
-    if (strcmp(kind, JOB_KIND_UPDATE) == 0) {
+    if (interactive_shell) {
+        /* Real interactive shell so focus shows user@host */
+        fprintf(sf, "echo running > \"$STAGE_FILE\"\n");
+        fprintf(sf, "export TERM=\"${TERM:-xterm-256color}\"\n");
+        fprintf(sf, "exec /bin/bash -l\n");
+    } else if (strcmp(kind, JOB_KIND_UPDATE) == 0) {
         if (strcmp(st->family, "arch") == 0) {
             fprintf(sf, "echo updating_indexes > \"$STAGE_FILE\"\n");
             fprintf(sf, "pacman -Sy --noconfirm\n");
@@ -136,7 +151,6 @@ int agent_job_start(struct agent_state *st, const char *job_id, const char *kind
         } else {
             fprintf(sf, "echo 'unsupported distro family' >&2\nexit 2\n");
         }
-        /* After packages: pull latest agent binary from the control server */
         fprintf(sf, "ec_pkg=$?\n");
         fprintf(sf, "echo 'Updating nsimaj agent from server...'\n");
         fprintf(sf, "NSIMAJ_SRV='%s'\n", st->server_host);
@@ -156,7 +170,6 @@ int agent_job_start(struct agent_state *st, const char *job_id, const char *kind
         fprintf(sf, "ec=$ec_pkg\n");
         fprintf(sf, "if [ \"$ec\" -eq 0 ]; then echo done > \"$STAGE_FILE\"; "
                     "else echo failed > \"$STAGE_FILE\"; fi\n");
-        /* Restart agent after stage is written (job runs in tmux, not the agent PID) */
         fprintf(sf, "systemctl restart nsimaj-agent 2>/dev/null || true\n");
         fprintf(sf, "exit \"$ec\"\n");
     } else if (strcmp(kind, JOB_KIND_EXEC) == 0) {
@@ -164,7 +177,7 @@ int agent_job_start(struct agent_state *st, const char *job_id, const char *kind
         if (payload && payload[0])
             fprintf(sf, "%s\n", payload);
         else
-            fprintf(sf, "bash\n");
+            fprintf(sf, "exec /bin/bash -l\n");
         fprintf(sf, "ec=$?\n");
         fprintf(sf, "if [ \"$ec\" -eq 0 ]; then echo done > \"$STAGE_FILE\"; "
                     "else echo failed > \"$STAGE_FILE\"; fi\n");
@@ -181,26 +194,43 @@ int agent_job_start(struct agent_state *st, const char *job_id, const char *kind
         send_stage(st, STAGE_RUNNING, -1, NULL);
 
     if (have_tmux) {
-        char tmuxcmd[768];
-        /* Pipe through tee so focus can still follow the log if attach fails */
+        char tmuxcmd[1024];
         snprintf(tmuxcmd, sizeof tmuxcmd,
-                 "TERM=xterm-256color tmux new-session -d -s %s -x 80 -y 24 "
-                 "sh -c '%s; ec=$?; exit $ec'",
+                 "TERM=xterm-256color tmux new-session -d -s %s -x 120 -y 40 -- "
+                 "/bin/sh %s",
                  session, script_path);
-        if (run_cmd(tmuxcmd) != 0)
+        if (run_cmd(tmuxcmd) != 0) {
             have_tmux = 0;
+            send_stage(st, STAGE_PREPARING, -1, "tmux new-session failed");
+        } else {
+            char check[256];
+            snprintf(check, sizeof check, "tmux has-session -t %s 2>/dev/null",
+                     session);
+            if (run_cmd(check) != 0) {
+                have_tmux = 0;
+                send_stage(st, STAGE_PREPARING, -1, "tmux session missing after create");
+            } else {
+                /* Mirror pane output into log for focus fallback */
+                char pipe_cmd[512];
+                snprintf(pipe_cmd, sizeof pipe_cmd,
+                         "tmux pipe-pane -t %s -o 'cat >> %s'", session, log_path);
+                run_cmd(pipe_cmd);
+            }
+        }
     }
 
     if (!have_tmux) {
         char cmd[2048];
         snprintf(cmd, sizeof cmd,
-                 "setsid sh -c '%s; echo $? > %s.exit' </dev/null & echo $! > %s",
-                 script_path, log_path, pid_path);
+                 "setsid sh -c '%s > %s 2>&1; echo $? > %s.exit' </dev/null & "
+                 "echo $! > %s",
+                 script_path, log_path, log_path, pid_path);
         if (run_cmd(cmd) != 0) {
             send_stage(st, STAGE_FAILED, 1, "failed to start job process");
             st->job_active = 0;
             return -1;
         }
+        send_stage(st, STAGE_PREPARING, -1, "running without tmux (log only)");
     }
     return 0;
 }
@@ -302,6 +332,21 @@ int agent_focus_start(struct agent_state *st, const char *job_id)
     char log_path[256];
     snprintf(log_path, sizeof log_path, "/tmp/nsimaj-log-%s", session);
 
+    /* Wait briefly for job_start to create the session */
+    int use_tmux = 0;
+    if (run_cmd("command -v tmux >/dev/null 2>&1") == 0) {
+        char check[256];
+        snprintf(check, sizeof check, "tmux has-session -t %s 2>/dev/null",
+                 session);
+        for (int i = 0; i < 20; i++) {
+            if (run_cmd(check) == 0) {
+                use_tmux = 1;
+                break;
+            }
+            util_sleep_ms(100);
+        }
+    }
+
     int mfd = open("/dev/ptmx", O_RDWR | O_NOCTTY);
     if (mfd < 0)
         return -1;
@@ -315,12 +360,6 @@ int agent_focus_start(struct agent_state *st, const char *job_id)
         return -1;
     }
 
-    int use_tmux = (run_cmd("command -v tmux >/dev/null 2>&1") == 0);
-    char check[256];
-    snprintf(check, sizeof check, "tmux has-session -t %s 2>/dev/null", session);
-    if (use_tmux && run_cmd(check) != 0)
-        use_tmux = 0;
-
     pid_t pid = fork();
     if (pid < 0) {
         close(mfd);
@@ -332,13 +371,12 @@ int agent_focus_start(struct agent_state *st, const char *job_id)
         if (sfd < 0)
             _exit(127);
         ioctl(sfd, TIOCSCTTY, 0);
-        /* tmux needs a real TERM with "clear" — default PTY TERM is often unset/dumb */
         setenv("TERM", "xterm-256color", 1);
         setenv("COLORTERM", "truecolor", 0);
         struct winsize ws;
         memset(&ws, 0, sizeof ws);
-        ws.ws_row = 24;
-        ws.ws_col = 80;
+        ws.ws_row = 40;
+        ws.ws_col = 120;
         ioctl(sfd, TIOCSWINSZ, &ws);
         dup2(sfd, STDIN_FILENO);
         dup2(sfd, STDOUT_FILENO);
@@ -349,12 +387,15 @@ int agent_focus_start(struct agent_state *st, const char *job_id)
         if (use_tmux)
             execlp("tmux", "tmux", "-u", "attach-session", "-t", session,
                    (char *)NULL);
-        /* Fallback: follow job log (always written by job script) */
+        /* No session: follow log with a clear banner (never leave a blank PTY) */
         execlp("sh", "sh", "-c",
                "export TERM=xterm-256color; "
-               "printf '\\n[nsimaj] tmux attach failed or missing — "
-               "showing job log (Ctrl-N to detach)\\n\\n'; "
-               "touch \"$1\"; tail -n +1 -f \"$1\"",
+               "printf '\\r\\n[nsimaj] no tmux session — showing job log "
+               "(Ctrl-N to detach)\\r\\n\\r\\n'; "
+               "touch \"$1\"; "
+               "if [ ! -s \"$1\" ]; then "
+               "printf '(log empty so far — waiting for output...)\\r\\n'; fi; "
+               "tail -n +1 -f \"$1\"",
                "sh", log_path, (char *)NULL);
         _exit(127);
     }

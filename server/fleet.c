@@ -615,6 +615,8 @@ int fleet_focus(struct fleet *f, int index)
         json_buf_printf(&jb, "}");
         frame_send_str(a->fd, jb.data);
         json_buf_free(&jb);
+        /* Give the agent a moment to create the tmux session before attach */
+        util_sleep_ms(400);
     }
 
     struct json_buf b;
@@ -630,7 +632,7 @@ int fleet_focus(struct fleet *f, int index)
     json_buf_free(&b);
     a->focusing = 1;
     f->focus_agent = index;
-    fleet_set_status(f, "Focused %s — Ctrl-B D to detach (or F2)", a->hostname);
+    fleet_set_status(f, "Focused %s — Ctrl-N to detach", a->hostname);
     return 0;
 }
 
