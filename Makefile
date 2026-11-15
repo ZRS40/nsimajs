@@ -1,21 +1,34 @@
 CC = gcc
-TARGET = app
-SRC = main.c network.c arp.c sshcon.c
+CFLAGS = -O2 -Wall -Wextra -std=gnu11
+FULL_WARNINGS = -Wpedantic -Wshadow -Wformat=2 -Wstrict-prototypes -Wmissing-prototypes
 
-CFLAGS = -O2
-FULL_WARNINGS = -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wformat=2 -Wstrict-prototypes -Wmissing-prototypes -Werror
+COMMON_SRC = common/frame.c common/json.c common/util.c common/firewall.c
+SERVER_SRC = server/main.c server/fleet.c server/http.c server/tui.c $(COMMON_SRC)
+AGENT_SRC  = agent/main.c agent/jobs.c agent/osinfo.c $(COMMON_SRC)
 
-.PHONY: all warnings clean rebuild
+.PHONY: all warnings clean rebuild install-assets test-local
 
-all: $(TARGET)
+all: nsimajd nsimaj-agent install-assets
 
-$(TARGET): $(SRC)
-	$(CC) $(CFLAGS) $(SRC) -o $(TARGET)
+warnings: CFLAGS += $(FULL_WARNINGS)
+warnings: all
 
-warnings:
-	$(CC) $(CFLAGS) $(FULL_WARNINGS) $(SRC) -o $(TARGET)
+nsimajd: $(SERVER_SRC) protocol/protocol.h
+	$(CC) $(CFLAGS) $(SERVER_SRC) -o $@
+
+nsimaj-agent: $(AGENT_SRC) protocol/protocol.h
+	$(CC) $(CFLAGS) $(AGENT_SRC) -o $@
+
+install-assets: nsimaj-agent
+	cp -f nsimaj-agent bootstrap/nsimaj-agent
+	chmod +x bootstrap/install.sh bootstrap/nsimaj-agent
 
 clean:
-	rm -f $(TARGET)
+	rm -f nsimajd nsimaj-agent bootstrap/nsimaj-agent
 
 rebuild: clean all
+
+test-local: all
+	@echo "Run in two terminals:"
+	@echo "  ./nsimajd --secret nsimaj --assets ./bootstrap"
+	@echo "  ./nsimaj-agent --server 127.0.0.1 --secret nsimaj"

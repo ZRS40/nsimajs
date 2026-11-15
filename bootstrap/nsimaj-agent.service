@@ -1,0 +1,15 @@
+[Unit]
+Description=nsimaj update agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/nsimaj-agent --config /etc/nsimaj/agent.conf
+Restart=always
+RestartSec=3
+# Root required for apt/pacman upgrades
+User=root
+
+[Install]
+WantedBy=multi-user.target

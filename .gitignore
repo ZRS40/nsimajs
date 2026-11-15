@@ -1,0 +1,5 @@
+nsimajd
+nsimaj-agent
+bootstrap/nsimaj-agent
+*.o
+app

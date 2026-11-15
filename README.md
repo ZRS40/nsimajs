@@ -1,56 +1,130 @@
-# ARP scanner
+# nsimaj
 
-Le programme découvre les hôtes IPv4 du réseau local avec des requêtes ARP.
+LAN control plane for mass package updates: a **server** on the teacher PC and a
+**persistent agent** on each student machine.
 
-1. `network_select` liste les interfaces IPv4 actives et récupère IP, masque,
-   MAC et index de l'interface choisie.
-2. `main` ouvre un socket `AF_PACKET`, le limite au protocole ARP, puis lance
-   le scan.
-3. `arp_scan` envoie une requête à chaque adresse hôte, attend les réponses
-   pendant 2 secondes après le dernier paquet, filtre les trames ARP invalides
-   et affiche chaque IP/MAC une seule fois.
-4. `ssh_console` garde ensuite la main dans le terminal. Elle demande le user
-   et le mot de passe SSH une seule fois, puis `update` demande le mot de passe
-   sudo au premier besoin. Les valeurs sont enregistrées dans
-   `~/.config/nsimaj/config` avec les permissions `0600`.
-   `update` détecte `/etc/os-release` sur chaque hôte et utilise
-   `apt-get` pour Debian/Ubuntu ou `pacman` pour Arch. Une distribution
-   inconnue est signalée sans exécuter de commande.
-   Chaque mise à jour est lancée dans une session `tmux` distante nommée
-   `nsimaj-update`, afin de continuer même si la connexion SSH est coupée.
-   `tmux` est installé automatiquement par SSH s'il est absent :
-   `apt-get install -y tmux` sur Debian/Ubuntu ou
-   `pacman -Sy --noconfirm tmux` sur Arch.
-   Les commandes sont lancées en parallèle et restent en arrière-plan.
-   Les logs sont silencieux par défaut : seuls les succès et échecs sont
-   annoncés. `focus <ip>` affiche les logs d'une machine et lui transmet
-   `Ctrl+C`; `back` masque à nouveau les logs. Les jobs restent en arrière-plan
-   et `jobs` liste leur état, sans `screen`.
-   Les logs sont enregistrés séparément dans
-   `~/.config/nsimaj/ssh-<ip>.log`; le contenu déjà produit est affiché dès
-   qu'un job est focalisé.
+Agents connect out to the server, announce they are online (heartbeats), and wait
+for orders. Jobs run inside **tmux** so you can focus a host interactively, detach,
+and leave the work running.
 
-La connexion utilise `sshpass` et l'authentification par mot de passe.
-Le démon SSH doit déjà être actif sur les machines distantes. Les nouvelles
-clés d'hôte sont acceptées automatiquement ; une clé déjà connue qui change
-reste refusée et sera indiquée dans les logs.
-
-Le programme demande automatiquement le mot de passe sudo au lancement,
-valide les privilèges puis se relance en root. Il peut donc être lancé
-directement :
+## Build
 
 ```sh
-./app
+make
 ```
 
-Compilation :
+Produces `nsimajd` (server + TUI) and `nsimaj-agent`, and copies the agent into
+`bootstrap/` for HTTP install.
+
+## Server (teacher PC)
 
 ```sh
-make warnings
+./nsimajd
 ```
 
-`sshpass` doit être installé avant l'utilisation :
+On first launch it lists network interfaces, lets you pick one (IP is taken from
+that iface), asks for the **join secret**, then saves `~/.config/nsimaj/server.conf`.
+Later launches load that file and start immediately (no re-prompt). If you ever ran
+the server with `sudo` and config is not writable, fix with:
+`sudo chown -R "$USER":"$USER" ~/.config/nsimaj`.
+
+Headless / non-interactive:
 
 ```sh
-sudo apt install sshpass
+./nsimajd --headless --secret 'classroom' --advertise-ip 192.168.1.10 -y
+```
+
+Options:
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--secret` | prompt / config | Shared join secret |
+| `--advertise-ip` | auto-detect | IP shown in install curl / injected into `install.sh` |
+| `--port` | `7422` | Agent control TCP port |
+| `--http-port` | `7421` | Bootstrap HTTP port |
+| `--assets` | `./bootstrap` | Directory with `install.sh`, agent binary, unit |
+| `--bind` | `0.0.0.0` | Listen address |
+| `--headless` | off | No TUI; status on stderr, commands on stdin |
+| `-y` / `--yes` | off | Skip interactive setup prompts |
+
+### TUI keys
+
+| Key | Action |
+|-----|--------|
+| `j` / `k` or arrows | Move cursor |
+| `space` | Select / deselect host |
+| `a` | Select all / clear |
+| `u` | Update selected (or all if none selected) — confirms first |
+| `e` | Start `exec …` command line |
+| `c` | Cancel jobs on selected/all |
+| `f` | Focus current host (attach to its tmux job) |
+| `Ctrl-N` | Detach from focus (job keeps running) |
+| `:` | Command mode (`update`, `exec …`, `cancel`, `focus N`, `quit`) |
+| `q` | Quit server |
+
+## Bootstrap each student PC
+
+With the server running (use the command shown in the TUI — IP is filled in):
+
+```sh
+curl -fsSL http://192.168.1.10:7421/install.sh | sudo bash
+```
+
+The script asks for server IP / secret via the TTY (or offers to reuse an existing
+`/etc/nsimaj/agent.conf`), installs `tmux`, saves the agent config (`chmod 0600`),
+installs the binary, and enables the systemd service. Host id comes from
+`/etc/hostname` (works on Arch without the `hostname` binary).
+
+### Manual agent (dev)
+
+```sh
+./nsimaj-agent --server 192.168.1.10 --secret classroom
+```
+
+## What `update` does
+
+On each targeted agent:
+
+1. Detect distro family (`debian` for Linux Mint/Ubuntu/Debian, `arch` for Arch)
+2. Ensure `tmux` is installed (also installed at bootstrap)
+3. Run package upgrade in a detached tmux session
+4. Download the latest `nsimaj-agent` (+ unit) from the server HTTP port and restart the service
+5. Stream stages: `queued` → `preparing` → `updating_indexes` → `upgrading` → `done`/`failed`
+
+Re-running the install curl on a PC also refreshes the agent binary from the server.
+
+Job history: `~/.config/nsimaj/jobs.log` (or `/tmp/nsimaj-jobs.log` if that directory is not writable).
+
+Note: a full `pacman -Su` / `apt-get upgrade` may update grub/shim and write under
+`/boot/efi` (e.g. EFI/Boot/HP on HP machines) — that is the package manager, not
+nsimaj copying those folders.
+
+## Firewall (ufw)
+
+- `nsimajd` tries to open **7421/tcp** and **7422/tcp** when ufw is active (needs root or passwordless sudo)
+- The install script opens **outbound** rules toward the server on those ports
+
+Manual fallback:
+
+```sh
+sudo ufw allow 7421/tcp comment nsimaj-bootstrap
+sudo ufw allow 7422/tcp comment nsimaj-control
+```
+
+## Security notes
+
+- Designed for a **trusted school LAN**
+- Shared secret stops casual registration; there is **no TLS** in v1
+- Agents run as **root** (needed for apt/pacman)
+- Do not expose ports 7421/7422 beyond the LAN
+
+## Layout
+
+```text
+common/     framing, JSON helpers, utils
+server/     nsimajd + fleet + HTTP bootstrap + TUI
+agent/      nsimaj-agent (daemon)
+bootstrap/  install.sh, systemd unit, packaged agent binary
+protocol/   message documentation
+legacy/     previous ARP+SSH single-binary code
 ```
