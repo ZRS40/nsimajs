@@ -1,0 +1,10 @@
+[Unit]
+Description=nsimajd self-update (git tag + make)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/nsimaj
+ExecStart=/opt/nsimaj/bootstrap/nsimajd-update.sh
+Nice=10
