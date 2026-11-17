@@ -3,9 +3,11 @@
 LAN control plane for mass package updates: a **server** on the teacher PC and a
 **persistent agent** on each student machine.
 
-Agents connect out to the server, announce they are online (heartbeats), and wait
-for orders. Jobs run inside **tmux** so you can focus a host interactively, detach,
-and leave the work running.
+Agents connect out to the server, announce they are online (heartbeats every 2s),
+and wait for orders. A host goes **off** immediately on TCP drop (or after 6s
+without traffic). Reconnects merge back onto the same roster row by agent id.
+Jobs run inside **tmux** so you can focus a host interactively, detach, and leave
+the work running.
 
 ## Build
 
@@ -14,9 +16,12 @@ make
 ```
 
 Produces `nsimajd` (server + TUI) and `nsimaj-agent`, and copies the agent into
-`bootstrap/` for HTTP install.
+`bootstrap/` for HTTP install. The binary version string comes from
+`git describe --tags` when available (e.g. `v0.2.0`).
 
 ## Server (teacher PC)
+
+### Quick start (foreground)
 
 ```sh
 ./nsimajd
@@ -27,6 +32,49 @@ that iface), asks for the **join secret**, then saves `~/.config/nsimaj/server.c
 Later launches load that file and start immediately (no re-prompt). If you ever ran
 the server with `sudo` and config is not writable, fix with:
 `sudo chown -R "$USER":"$USER" ~/.config/nsimaj`.
+
+### Install as a systemd service (recommended)
+
+```sh
+sudo ./bootstrap/install-server.sh
+# or: make install-server
+```
+
+The script asks which Unix user owns the SSH key for `git@github.com` (default:
+the user who ran `sudo`, e.g. `paul`). It **rsyncs this local tree** into
+`/opt/nsimaj` (so unpushed files are included), then `git fetch` as that user
+for later tag updates. The choice is saved in `/opt/nsimaj/.nsimaj-git-user`.
+Override non-interactively with `NSIMAJ_GIT_USER=paul sudo -E ./bootstrap/install-server.sh`.
+
+This enables `nsimajd.service` (headless daemon) and a daily
+`nsimajd-update.timer` that fetches the latest **git tag** (`v*`), runs `make`,
+and restarts the service. If the build fails, it rolls back to the last good tag.
+
+For the interactive TUI on the teacher PC:
+
+```sh
+sudo systemctl stop nsimajd
+/opt/nsimaj/nsimajd
+# when done: sudo systemctl start nsimajd
+```
+
+Control cheat-sheet (also shown in the TUI with **`S`** / **`:svc`**):
+
+```sh
+systemctl status nsimajd
+systemctl restart nsimajd
+systemctl start nsimajd-update          # pull latest tag + make + restart
+journalctl -u nsimajd-update -n 50
+systemctl status nsimajd-update.timer
+```
+
+Publish a new server release:
+
+```sh
+git tag v0.2.0
+git push origin v0.2.0
+# then on the teacher box: systemctl start nsimajd-update
+```
 
 Headless / non-interactive:
 
@@ -58,9 +106,12 @@ Options:
 | `e` | Start `exec …` command line |
 | `c` | Cancel jobs on selected/all |
 | `f` | Focus current host (attach to its tmux job) |
+| `S` | Show systemd service control commands |
 | `Ctrl-N` | Detach from focus (job keeps running) |
-| `:` | Command mode (`update`, `exec …`, `cancel`, `focus N`, `quit`) |
+| `:` | Command mode (`update`, `exec …`, `cancel`, `focus N`, `svc`, `quit`) |
 | `q` | Quit server |
+
+Failed jobs show in red with an **ERR** column (`last_error` from the agent).
 
 ## Bootstrap each student PC
 
@@ -124,7 +175,7 @@ sudo ufw allow 7422/tcp comment nsimaj-control
 common/     framing, JSON helpers, utils
 server/     nsimajd + fleet + HTTP bootstrap + TUI
 agent/      nsimaj-agent (daemon)
-bootstrap/  install.sh, systemd unit, packaged agent binary
+bootstrap/  install scripts, systemd units, packaged agent binary
 protocol/   message documentation
 legacy/     previous ARP+SSH single-binary code
 ```

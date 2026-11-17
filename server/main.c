@@ -39,9 +39,10 @@ static void headless_status(struct fleet *f)
         struct agent *a = &f->agents[i];
         if (!a->used || !a->authenticated)
             continue;
-        fprintf(stderr, "  - %s ip=%s distro=%s upd=%d stage=%s online=%d\n",
+        fprintf(stderr,
+                "  - %s ip=%s distro=%s upd=%d stage=%s online=%d err=%s\n",
                 a->hostname, a->ip, a->distro, a->pending_updates, a->job_stage,
-                a->online);
+                a->online, a->last_error[0] ? a->last_error : "-");
     }
 }
 
@@ -98,40 +99,66 @@ static void check_offline(struct fleet *f)
         struct agent *a = &f->agents[i];
         if (!a->used || !a->authenticated)
             continue;
-        if (a->online && now - a->last_seen > NSIMAJ_OFFLINE_SEC) {
-            a->online = 0;
-            fleet_touch(f);
-            fleet_set_status(f, "Agent timed out: %s", a->hostname);
-        }
+        if (a->online && now - a->last_seen > NSIMAJ_OFFLINE_SEC)
+            fleet_disconnect(f, a);
     }
 }
 
 static void pump_agent(struct fleet *f, struct agent *a)
 {
+    if (!a || !a->used || a->fd < 0)
+        return;
+
     char tmp[8192];
     ssize_t n = read(a->fd, tmp, sizeof tmp);
     if (n < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK)
             return;
-        fleet_remove(f, a);
+        fleet_disconnect(f, a);
         return;
     }
     if (n == 0) {
-        fleet_remove(f, a);
+        fleet_disconnect(f, a);
         return;
     }
 
     char *frame = NULL;
     int flen = frame_reader_feed(&a->reader, tmp, (size_t)n, &frame);
     if (flen < 0) {
-        fleet_remove(f, a);
+        fleet_disconnect(f, a);
         return;
     }
     while (flen > 0) {
         int special = fleet_handle_message(f, a, frame);
         if (special < 0) {
             free(frame);
+            /* Auth / protocol rejection: drop the slot. */
             fleet_remove(f, a);
+            return;
+        }
+        if (special == 2) {
+            /* HELLO merged into an existing roster slot; drain leftover frames. */
+            char id[NSIMAJ_ID_LEN];
+            id[0] = '\0';
+            json_get_string(frame, "id", id, sizeof id);
+            free(frame);
+            frame = NULL;
+            struct agent *ex = id[0] ? fleet_find_id(f, id) : NULL;
+            if (ex && ex->used) {
+                int more = frame_reader_feed(&ex->reader, "", 0, &frame);
+                while (more > 0) {
+                    int sp = fleet_handle_message(f, ex, frame);
+                    free(frame);
+                    frame = NULL;
+                    if (sp < 0) {
+                        fleet_remove(f, ex);
+                        return;
+                    }
+                    more = frame_reader_feed(&ex->reader, "", 0, &frame);
+                }
+                if (more < 0)
+                    fleet_disconnect(f, ex);
+            }
             return;
         }
         if (special == 1 && tui_in_focus() && f->focus_agent >= 0 &&
@@ -146,9 +173,11 @@ static void pump_agent(struct fleet *f, struct agent *a)
         }
         free(frame);
         frame = NULL;
+        if (!a->used || a->fd < 0)
+            return;
         flen = frame_reader_feed(&a->reader, "", 0, &frame);
         if (flen < 0) {
-            fleet_remove(f, a);
+            fleet_disconnect(f, a);
             return;
         }
     }
@@ -310,6 +339,12 @@ int main(int argc, char **argv)
                         fleet_start_job(&fleet, JOB_KIND_EXEC, line + 5);
                     else if (strcmp(line, "cancel") == 0)
                         fleet_cancel_jobs(&fleet);
+                    else if (strcmp(line, "svc") == 0 ||
+                             strcmp(line, "service") == 0)
+                        fprintf(stderr,
+                                "svc: systemctl status|restart nsimajd | "
+                                "start nsimajd-update | "
+                                "status nsimajd-update.timer\n");
                     else if (line[0])
                         fprintf(stderr, "unknown command: %s\n", line);
                 }

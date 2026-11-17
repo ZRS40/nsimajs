@@ -1,0 +1,16 @@
+[Unit]
+Description=nsimaj control plane (teacher server)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/nsimaj
+ExecStart=/opt/nsimaj/nsimajd --assets /opt/nsimaj/bootstrap --headless -y
+Restart=always
+RestartSec=2
+# Root helps with ufw + binding privileged paths; drop later if undesired.
+User=root
+
+[Install]
+WantedBy=multi-user.target
