@@ -16,11 +16,6 @@ log() { printf '%s %s\n' "$(date -Is)" "$*"; }
 
 cd "$ROOT"
 
-if ! git rev-parse --git-dir >/dev/null 2>&1; then
-  log "ERROR: $ROOT is not a git checkout"
-  exit 1
-fi
-
 git_user="${NSIMAJ_GIT_USER:-}"
 if [[ -z "$git_user" && -f "$GIT_USER_FILE" ]]; then
   git_user=$(tr -d '[:space:]' <"$GIT_USER_FILE")
@@ -38,6 +33,22 @@ git_as_user() {
     "$@"
   fi
 }
+
+# Root often owns a different HOME than the checkout; avoid "dubious ownership".
+if [[ "$(id -u)" -eq 0 ]]; then
+  if ! git config --global --get-all safe.directory 2>/dev/null | grep -qx "$ROOT"; then
+    git config --global --add safe.directory "$ROOT" || true
+    log "added safe.directory $ROOT for root git"
+  fi
+fi
+
+git_err=$(mktemp)
+if ! git_as_user git rev-parse --git-dir >"$git_err" 2>&1; then
+  log "ERROR: $ROOT is not a usable git checkout (as $git_user): $(tr '\n' ' ' <"$git_err")"
+  rm -f "$git_err"
+  exit 1
+fi
+rm -f "$git_err"
 
 prev=""
 if [[ -f "$GOOD_FILE" ]]; then

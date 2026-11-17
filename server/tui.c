@@ -21,6 +21,13 @@ static size_t cmd_len;
 
 static void get_winsize(int *rows, int *cols);
 
+static void term_mouse_off(void)
+{
+    /* Defensive: focus/tmux may have enabled mouse reporting. */
+    write(STDOUT_FILENO,
+          "\033[?1000l\033[?1002l\033[?1003l\033[?1006l\033[?1015l", 40);
+}
+
 void tui_init(void)
 {
     if (tcgetattr(STDIN_FILENO, &orig_term) == 0) {
@@ -31,11 +38,13 @@ void tui_init(void)
         tcsetattr(STDIN_FILENO, TCSANOW, &raw);
         raw_mode = 1;
     }
+    term_mouse_off();
     write(STDOUT_FILENO, "\033[?1049h\033[2J\033[H\033[?25l", 19);
 }
 
 void tui_restore(void)
 {
+    term_mouse_off();
     if (raw_mode)
         tcsetattr(STDIN_FILENO, TCSANOW, &orig_term);
     write(STDOUT_FILENO, "\033[?1049l\033[?25h\033[0m", 18);
@@ -67,6 +76,7 @@ void tui_leave_focus(struct fleet *f)
 {
     (void)f;
     focus_mode = 0;
+    term_mouse_off();
     write(STDOUT_FILENO, "\033[2J\033[H\033[?25l", 12);
 }
 
@@ -229,8 +239,73 @@ static int run_cmdline_client(struct fleet *f, int ctl_fd)
     return 0;
 }
 
+/* Drain mouse CSI (SGR / legacy). Returns 1 if ch was ESC and handled. */
+static int handle_esc_client(struct fleet *f, int ctl_fd)
+{
+    unsigned char b;
+    ssize_t n = read(STDIN_FILENO, &b, 1);
+    if (n != 1) {
+        if (focus_mode) {
+            unsigned char esc = 0x1b;
+            client_send_focus_stdin(ctl_fd, &esc, 1);
+        } else if (cmd_mode) {
+            cmd_mode = 0;
+            cmd_len = 0;
+            cmd_buf[0] = '\0';
+        } else if (f->confirm_pending) {
+            f->confirm_pending = 0;
+            snprintf(f->status_line, sizeof f->status_line, "Update cancelled.");
+            f->dirty = 1;
+        }
+        return 1;
+    }
+    if (b != '[') {
+        if (focus_mode) {
+            unsigned char esc = 0x1b;
+            client_send_focus_stdin(ctl_fd, &esc, 1);
+            client_send_focus_stdin(ctl_fd, &b, 1);
+        }
+        return 1;
+    }
+    n = read(STDIN_FILENO, &b, 1);
+    if (n != 1)
+        return 1;
+    /* Legacy mouse: ESC [ M Cb Cx Cy */
+    if (b == 'M') {
+        unsigned char junk[3];
+        (void)read(STDIN_FILENO, junk, 3);
+        return 1;
+    }
+    /* SGR mouse: ESC [ < ... M/m */
+    if (b == '<') {
+        while (read(STDIN_FILENO, &b, 1) == 1)
+            if (b == 'M' || b == 'm')
+                break;
+        return 1;
+    }
+    if (focus_mode) {
+        unsigned char seq[3] = {0x1b, '[', b};
+        client_send_focus_stdin(ctl_fd, seq, 3);
+        return 1;
+    }
+    if (cmd_mode || f->confirm_pending)
+        return 1;
+    int vc = visible_count(f);
+    if (b == 'A' && f->cursor > 0) {
+        f->cursor--;
+        client_send_cmd_int(ctl_fd, "set_cursor", "n", f->cursor);
+    } else if (b == 'B' && f->cursor + 1 < vc) {
+        f->cursor++;
+        client_send_cmd_int(ctl_fd, "set_cursor", "n", f->cursor);
+    }
+    return 1;
+}
+
 int tui_handle_input_client(struct fleet *f, unsigned char ch, int ctl_fd)
 {
+    if (ch == 0x1b)
+        return handle_esc_client(f, ctl_fd);
+
     if (focus_mode) {
         if (ch == 0x0e) {
             client_send_cmd(ctl_fd, "focus_detach");
@@ -252,7 +327,7 @@ int tui_handle_input_client(struct fleet *f, unsigned char ch, int ctl_fd)
             } else {
                 client_send_start_job(ctl_fd, JOB_KIND_UPDATE, NULL);
             }
-        } else if (ch == 'n' || ch == 'N' || ch == 0x1b || ch == 0x03) {
+        } else if (ch == 'n' || ch == 'N' || ch == 0x03) {
             f->confirm_pending = 0;
             snprintf(f->status_line, sizeof f->status_line, "Update cancelled.");
             f->dirty = 1;
@@ -261,7 +336,7 @@ int tui_handle_input_client(struct fleet *f, unsigned char ch, int ctl_fd)
     }
 
     if (cmd_mode) {
-        if (ch == 0x1b || ch == 0x03) {
+        if (ch == 0x03) {
             cmd_mode = 0;
             cmd_len = 0;
             cmd_buf[0] = '\0';
@@ -343,22 +418,6 @@ int tui_handle_input_client(struct fleet *f, unsigned char ch, int ctl_fd)
         cmd_len = 0;
         cmd_buf[0] = '\0';
         break;
-    case 0x1b: {
-        unsigned char seq[2];
-        if (read(STDIN_FILENO, seq, 1) == 1 && seq[0] == '[') {
-            if (read(STDIN_FILENO, seq + 1, 1) == 1) {
-                if (seq[1] == 'A' && f->cursor > 0) {
-                    f->cursor--;
-                    client_send_cmd_int(ctl_fd, "set_cursor", "n", f->cursor);
-                }
-                if (seq[1] == 'B' && f->cursor + 1 < vc) {
-                    f->cursor++;
-                    client_send_cmd_int(ctl_fd, "set_cursor", "n", f->cursor);
-                }
-            }
-        }
-        break;
-    }
     default:
         break;
     }

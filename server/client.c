@@ -23,6 +23,14 @@
 #define NSIMAJ_UPDATE_CHECK_FILE "/tmp/nsimaj-server-update-check"
 
 static pid_t g_update_check_pid = -1;
+static volatile sig_atomic_t g_tui_stop;
+
+static void on_tui_signal(int sig)
+{
+    (void)sig;
+    g_tui_stop = 1;
+    tui_restore();
+}
 
 int client_ensure_daemon(void)
 {
@@ -334,6 +342,10 @@ int client_run_tui(void)
 
     client_start_update_check();
 
+    g_tui_stop = 0;
+    signal(SIGINT, on_tui_signal);
+    signal(SIGTERM, on_tui_signal);
+
     tui_init();
     atexit(tui_restore);
 
@@ -341,7 +353,7 @@ int client_run_tui(void)
     frame_reader_init(&reader);
     long last_draw = 0;
 
-    while (fleet.running) {
+    while (fleet.running && !g_tui_stop) {
         struct pollfd pfds[2];
         pfds[0].fd = STDIN_FILENO;
         pfds[0].events = POLLIN;

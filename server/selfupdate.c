@@ -12,6 +12,18 @@ static void set_msg(char *msg, size_t msgsz, const char *text)
         snprintf(msg, msgsz, "%s", text);
 }
 
+static void print_update_log_tail(void)
+{
+    const char *logpath = getenv("NSIMAJ_UPDATE_LOG");
+    if (!logpath || !logpath[0])
+        logpath = "/var/log/nsimaj-update.log";
+    fprintf(stderr, "--- last lines of %s ---\n", logpath);
+    fflush(stderr);
+    char cmd[512];
+    snprintf(cmd, sizeof cmd, "tail -n 20 '%s' 2>/dev/null || true", logpath);
+    system(cmd);
+}
+
 int nsimaj_self_update(char *msg, size_t msgsz)
 {
     /* Prefer systemd oneshot when the unit exists. */
@@ -20,6 +32,8 @@ int nsimaj_self_update(char *msg, size_t msgsz)
         if (rc != 0) {
             set_msg(msg, msgsz,
                     "self-update failed (try: sudo nsimajd update)");
+            fprintf(stderr, "self-update failed (try: sudo nsimajd update)\n");
+            print_update_log_tail();
             return -1;
         }
         system("systemctl status nsimajd-update.service --no-pager -l 2>/dev/null || true");
@@ -44,6 +58,8 @@ int nsimaj_self_update(char *msg, size_t msgsz)
     int rc = system(cmd);
     if (rc != 0) {
         set_msg(msg, msgsz, "self-update script failed (check /var/log/nsimaj-update.log)");
+        fprintf(stderr, "self-update script failed\n");
+        print_update_log_tail();
         return -1;
     }
     set_msg(msg, msgsz, "Server self-update finished");
