@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/nsimaj
-ExecStart=/usr/local/bin/nsimajd --assets /opt/nsimaj/bootstrap --headless -y
+ExecStart=/usr/local/bin/nsimajd --daemon --assets /opt/nsimaj/bootstrap -y
 Restart=always
 RestartSec=2
 # Root helps with ufw + binding privileged paths; drop later if undesired.

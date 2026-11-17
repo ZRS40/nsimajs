@@ -21,51 +21,27 @@ Produces `nsimajd` (server + TUI) and `nsimaj-agent`, and copies the agent into
 
 ## Server (teacher PC)
 
-### Quick start (foreground)
-
-```sh
-./nsimajd
-```
-
-On first launch it lists network interfaces, lets you pick one (IP is taken from
-that iface), asks for the **join secret**, then saves `~/.config/nsimaj/server.conf`.
-Later launches load that file and start immediately (no re-prompt). If you ever ran
-the server with `sudo` and config is not writable, fix with:
-`sudo chown -R "$USER":"$USER" ~/.config/nsimaj`.
-
-### Install as a systemd service (recommended)
+### Install (once)
 
 ```sh
 sudo ./bootstrap/install-server.sh
 # or: make install-server
 ```
 
-The script asks which Unix user owns the SSH key for `git@github.com` (default:
-the user who ran `sudo`, e.g. `paul`), then **clones/fetches from GitHub** into
-`/opt/nsimaj` (latest `v*` tag if any, else default branch). Push your changes
-before installing. The SSH user is saved in `/opt/nsimaj/.nsimaj-git-user` for
-the update timer. Override with `NSIMAJ_GIT_USER=paul sudo -E ./bootstrap/install-server.sh`.
+Installs `/usr/local/bin/nsimajd`, enables `nsimajd.service` (daemon at boot —
+owns ports 7421/7422 and talks to agents), and a daily update timer. The script
+asks which Unix user owns the GitHub SSH key (saved in `/opt/nsimaj/.nsimaj-git-user`).
 
-This installs `/usr/local/bin/nsimajd` on PATH, enables `nsimajd.service`
-(headless daemon), and a daily `nsimajd-update.timer` that fetches the latest
-**git tag** (`v*`), runs `make`, refreshes the PATH binary, and restarts. If the
-build fails, it rolls back to the last good tag.
-
-Self-update (one command):
+### Daily use
 
 ```sh
-sudo nsimajd update
+nsimajd              # attach TUI to the running daemon (does not restart it)
+sudo nsimajd update  # self-update server from latest git tag
 ```
 
-Or from the TUI: press **`S`** (or `:self-update`) and confirm.
-
-Interactive TUI on the teacher PC:
-
-```sh
-sudo systemctl stop nsimajd
-nsimajd
-# when done: sudo systemctl start nsimajd
-```
+Quit the TUI with `q` — the **daemon keeps running**. No need to stop the service
+to open the UI. `nsimajd` will `systemctl start nsimajd` automatically if the
+socket is missing.
 
 Publish a new server release:
 
@@ -75,24 +51,27 @@ git push origin v0.2.0
 sudo nsimajd update
 ```
 
-Headless / non-interactive:
+Daemon manually (dev):
 
 ```sh
-./nsimajd --headless --secret 'classroom' --advertise-ip 192.168.1.10 -y
+./nsimajd --daemon --secret 'classroom' --advertise-ip 192.168.1.10 -y
+# other terminal:
+./nsimajd
 ```
 
-Options:
+Options (daemon):
 
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `--secret` | prompt / config | Shared join secret |
+| `--daemon` | off | Run control plane (systemd uses this) |
+| `--secret` | config / `nsimaj` | Shared join secret |
 | `--advertise-ip` | auto-detect | IP shown in install curl / injected into `install.sh` |
 | `--port` | `7422` | Agent control TCP port |
 | `--http-port` | `7421` | Bootstrap HTTP port |
 | `--assets` | `./bootstrap` | Directory with `install.sh`, agent binary, unit |
 | `--bind` | `0.0.0.0` | Listen address |
-| `--headless` | off | No TUI; status on stderr, commands on stdin |
-| `-y` / `--yes` | off | Skip interactive setup prompts |
+| `--headless` | off | Alias of `--daemon` |
+| `-y` / `--yes` | off | Non-interactive daemon flags |
 
 ### TUI keys
 
@@ -108,7 +87,7 @@ Options:
 | `S` | Self-update **server** (git tag + make + restart) — confirms first |
 | `Ctrl-N` | Detach from focus (job keeps running) |
 | `:` | Command mode (`update`, `self-update`, `exec …`, `cancel`, `focus N`, `quit`) |
-| `q` | Quit server |
+| `q` | Quit TUI (daemon keeps running) |
 
 Failed jobs show in red with an **ERR** column (`last_error` from the agent).
 

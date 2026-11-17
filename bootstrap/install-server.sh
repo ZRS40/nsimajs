@@ -125,15 +125,12 @@ nsimajd installed and running from GitHub.
 Binary on PATH: /usr/local/bin/nsimajd
 Git/SSH user: $git_user (saved in $DEST/$GIT_USER_FILE)
 
-Self-update (one command):
+Daily use (service stays running; TUI attaches):
+  nsimajd
+
+Self-update:
   sudo nsimajd update
-  # or in the TUI: press S (or :self-update)
-
-Service control:
-  systemctl status|restart|stop nsimajd
-
-Interactive TUI:
-  sudo systemctl stop nsimajd && nsimajd
+  # or in the TUI: press S
 
 Release a new version:
   git tag v0.2.0 && git push origin v0.2.0

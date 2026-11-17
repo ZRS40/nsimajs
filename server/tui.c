@@ -1,9 +1,9 @@
 #define _DEFAULT_SOURCE
 #include "tui.h"
-#include "selfupdate.h"
+#include "client.h"
 
-#include "../common/json.h"
 #include "../common/util.h"
+#include "../protocol/protocol.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -48,13 +48,14 @@ int tui_in_focus(void)
     return focus_mode;
 }
 
-void tui_enter_focus(struct fleet *f)
+void tui_enter_focus_client(struct fleet *f, int ctl_fd)
 {
+    (void)f;
     focus_mode = 1;
     write(STDOUT_FILENO, "\033[2J\033[H\033[?25h", 12);
     int rows = 24, cols = 80;
     get_winsize(&rows, &cols);
-    fleet_send_focus_resize(f, rows, cols);
+    client_send_focus_resize(ctl_fd, rows, cols);
 }
 
 void tui_leave_focus(struct fleet *f)
@@ -82,19 +83,6 @@ static void get_winsize(int *rows, int *cols)
     }
 }
 
-static int visible_index(struct fleet *f, int nth)
-{
-    int seen = 0;
-    for (int i = 0; i < NSIMAJ_MAX_AGENTS; i++) {
-        if (!f->agents[i].used || !f->agents[i].authenticated)
-            continue;
-        if (seen == nth)
-            return i;
-        seen++;
-    }
-    return -1;
-}
-
 static int visible_count(struct fleet *f)
 {
     int n = 0;
@@ -118,7 +106,7 @@ void tui_draw(struct fleet *f)
     char line[512];
     int n = snprintf(line, sizeof line,
                      "\033[1mnsimaj\033[0m control  v%s  |  online %d  |  "
-                     "port %d  |  secret set\r\n",
+                     "port %d  |  daemon\r\n",
                      NSIMAJ_VERSION, fleet_online_count(f), f->control_port);
     write(STDOUT_FILENO, line, (size_t)n);
 
@@ -175,7 +163,6 @@ void tui_draw(struct fleet *f)
         write(STDOUT_FILENO, line, (size_t)n);
     }
 
-    /* Status / command line */
     n = snprintf(line, sizeof line, "\r\n\033[1m%s\033[0m\r\n", f->status_line);
     write(STDOUT_FILENO, line, (size_t)n);
 
@@ -193,49 +180,37 @@ void tui_draw(struct fleet *f)
     }
 }
 
-static void toggle_select_cursor(struct fleet *f)
-{
-    int idx = visible_index(f, f->cursor);
-    if (idx >= 0)
-        f->selected[idx] = !f->selected[idx];
-}
-
-static void select_all(struct fleet *f)
-{
-    int any = fleet_selected_count(f) > 0;
-    for (int i = 0; i < NSIMAJ_MAX_AGENTS; i++) {
-        if (f->agents[i].used && f->agents[i].authenticated)
-            f->selected[i] = any ? 0 : 1;
-    }
-}
-
 static void request_self_update(struct fleet *f)
 {
     f->confirm_pending = 2;
-    fleet_set_status(f, "Confirm SERVER self-update?");
+    snprintf(f->status_line, sizeof f->status_line, "Confirm SERVER self-update?");
+    f->dirty = 1;
 }
 
-static int run_cmdline(struct fleet *f)
+static int run_cmdline_client(struct fleet *f, int ctl_fd)
 {
     if (strcmp(cmd_buf, "self-update") == 0 ||
         strcmp(cmd_buf, "selfupdate") == 0) {
         request_self_update(f);
     } else if (strncmp(cmd_buf, "update", 6) == 0) {
         f->confirm_pending = 1;
-        fleet_set_status(f, "Confirm package update?");
+        snprintf(f->status_line, sizeof f->status_line, "Confirm package update?");
+        f->dirty = 1;
     } else if (strncmp(cmd_buf, "exec ", 5) == 0) {
-        fleet_start_job(f, JOB_KIND_EXEC, cmd_buf + 5);
+        client_send_start_job(ctl_fd, JOB_KIND_EXEC, cmd_buf + 5);
     } else if (strcmp(cmd_buf, "cancel") == 0) {
-        fleet_cancel_jobs(f);
+        client_send_cmd(ctl_fd, "cancel");
     } else if (strncmp(cmd_buf, "focus ", 6) == 0) {
         int n = atoi(cmd_buf + 6);
-        int idx = visible_index(f, n);
-        if (idx >= 0 && fleet_focus(f, idx) == 0)
-            tui_enter_focus(f);
+        client_send_cmd_int(ctl_fd, "set_cursor", "n", n);
+        if (client_send_cmd_int(ctl_fd, "focus", "n", n) == 0)
+            tui_enter_focus_client(f, ctl_fd);
     } else if (strcmp(cmd_buf, "quit") == 0 || strcmp(cmd_buf, "q") == 0) {
         f->running = 0;
     } else {
-        fleet_set_status(f, "Unknown command: %s", cmd_buf);
+        snprintf(f->status_line, sizeof f->status_line, "Unknown command: %s",
+                 cmd_buf);
+        f->dirty = 1;
     }
     cmd_mode = 0;
     cmd_len = 0;
@@ -243,29 +218,15 @@ static int run_cmdline(struct fleet *f)
     return 0;
 }
 
-int tui_handle_input(struct fleet *f, unsigned char ch)
+int tui_handle_input_client(struct fleet *f, unsigned char ch, int ctl_fd)
 {
     if (focus_mode) {
-        /* Detach: F2 or detect Ctrl-B D sequence simply via F2 */
-        if (ch == 0x02) { /* Ctrl-B — wait next; simplified: Ctrl-B then 'd' */
-            static int saw_b;
-            saw_b = 1;
-            (void)saw_b;
-            /* Pass through to remote as well for real tmux; also allow F2 */
-            fleet_send_focus_stdin(f, &ch, 1);
-            return 0;
-        }
-        if (ch == 0x7f || ch == 0x08) {
-            fleet_send_focus_stdin(f, &ch, 1);
-            return 0;
-        }
-        /* F2 = detach (ESC O Q or ESC [ 1 2 ~) — handle bare 0x0e as alt */
-        if (ch == 0x0e) { /* Ctrl-N also detach */
-            fleet_focus_detach(f);
+        if (ch == 0x0e) {
+            client_send_cmd(ctl_fd, "focus_detach");
             tui_leave_focus(f);
             return 0;
         }
-        fleet_send_focus_stdin(f, &ch, 1);
+        client_send_focus_stdin(ctl_fd, &ch, 1);
         return 0;
     }
 
@@ -274,19 +235,16 @@ int tui_handle_input(struct fleet *f, unsigned char ch)
             int kind = f->confirm_pending;
             f->confirm_pending = 0;
             if (kind == 2) {
-                char msg[256];
                 tui_restore();
-                if (nsimaj_self_update(msg, sizeof msg) == 0)
-                    fprintf(stderr, "%s\n", msg);
-                else
-                    fprintf(stderr, "%s\n", msg[0] ? msg : "self-update failed");
+                client_send_cmd(ctl_fd, "self_update");
                 f->running = 0;
             } else {
-                fleet_start_job(f, JOB_KIND_UPDATE, NULL);
+                client_send_start_job(ctl_fd, JOB_KIND_UPDATE, NULL);
             }
         } else if (ch == 'n' || ch == 'N' || ch == 0x1b || ch == 0x03) {
             f->confirm_pending = 0;
-            fleet_set_status(f, "Update cancelled.");
+            snprintf(f->status_line, sizeof f->status_line, "Update cancelled.");
+            f->dirty = 1;
         }
         return 0;
     }
@@ -297,7 +255,7 @@ int tui_handle_input(struct fleet *f, unsigned char ch)
             cmd_len = 0;
             cmd_buf[0] = '\0';
         } else if (ch == '\r' || ch == '\n') {
-            run_cmdline(f);
+            run_cmdline_client(f, ctl_fd);
         } else if (ch == 0x7f || ch == 0x08) {
             if (cmd_len)
                 cmd_buf[--cmd_len] = '\0';
@@ -317,25 +275,31 @@ int tui_handle_input(struct fleet *f, unsigned char ch)
         break;
     case 'j':
     case 0x0e:
-        if (f->cursor + 1 < vc)
+        if (f->cursor + 1 < vc) {
             f->cursor++;
+            client_send_cmd_int(ctl_fd, "set_cursor", "n", f->cursor);
+        }
         break;
     case 'k':
     case 0x10:
-        if (f->cursor > 0)
+        if (f->cursor > 0) {
             f->cursor--;
+            client_send_cmd_int(ctl_fd, "set_cursor", "n", f->cursor);
+        }
         break;
     case ' ':
-        toggle_select_cursor(f);
+        client_send_cmd(ctl_fd, "toggle_select");
         break;
     case 'a':
     case 'A':
-        select_all(f);
+        client_send_cmd(ctl_fd, "select_all");
         break;
     case 'u':
     case 'U':
         f->confirm_pending = 1;
-        fleet_set_status(f, "Confirm package update on selected (or all if none)?");
+        snprintf(f->status_line, sizeof f->status_line,
+                 "Confirm package update on selected (or all if none)?");
+        f->dirty = 1;
         break;
     case 'e':
     case 'E':
@@ -346,17 +310,19 @@ int tui_handle_input(struct fleet *f, unsigned char ch)
         break;
     case 'c':
     case 'C':
-        fleet_cancel_jobs(f);
+        client_send_cmd(ctl_fd, "cancel");
         break;
     case 'f':
-    case 'F': {
-        int idx = visible_index(f, f->cursor);
-        if (idx >= 0 && fleet_focus(f, idx) == 0)
-            tui_enter_focus(f);
-        else
-            fleet_set_status(f, "Cannot focus that agent");
+    case 'F':
+        client_send_cmd_int(ctl_fd, "set_cursor", "n", f->cursor);
+        if (client_send_cmd_int(ctl_fd, "focus", "n", f->cursor) == 0)
+            tui_enter_focus_client(f, ctl_fd);
+        else {
+            snprintf(f->status_line, sizeof f->status_line,
+                     "Cannot focus that agent");
+            f->dirty = 1;
+        }
         break;
-    }
     case 's':
     case 'S':
         request_self_update(f);
@@ -367,15 +333,17 @@ int tui_handle_input(struct fleet *f, unsigned char ch)
         cmd_buf[0] = '\0';
         break;
     case 0x1b: {
-        /* Arrow keys */
         unsigned char seq[2];
         if (read(STDIN_FILENO, seq, 1) == 1 && seq[0] == '[') {
             if (read(STDIN_FILENO, seq + 1, 1) == 1) {
-                if (seq[1] == 'A' && f->cursor > 0)
+                if (seq[1] == 'A' && f->cursor > 0) {
                     f->cursor--;
-                if (seq[1] == 'B' && f->cursor + 1 < vc)
+                    client_send_cmd_int(ctl_fd, "set_cursor", "n", f->cursor);
+                }
+                if (seq[1] == 'B' && f->cursor + 1 < vc) {
                     f->cursor++;
-                /* F2 often ESC [ 1 2 ~ — not fully parsed here */
+                    client_send_cmd_int(ctl_fd, "set_cursor", "n", f->cursor);
+                }
             }
         }
         break;
@@ -384,4 +352,10 @@ int tui_handle_input(struct fleet *f, unsigned char ch)
         break;
     }
     return 0;
+}
+
+/* Kept for API compatibility; daemon no longer uses in-process TUI. */
+int tui_handle_input(struct fleet *f, unsigned char ch)
+{
+    return tui_handle_input_client(f, ch, -1);
 }

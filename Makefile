@@ -9,7 +9,8 @@ CFLAGS += -DNSIMAJ_VERSION=\"$(GIT_VERSION)\"
 endif
 
 COMMON_SRC = common/frame.c common/json.c common/util.c common/firewall.c
-SERVER_SRC = server/main.c server/fleet.c server/http.c server/tui.c server/selfupdate.c $(COMMON_SRC)
+SERVER_SRC = server/main.c server/fleet.c server/http.c server/tui.c \
+	server/selfupdate.c server/ctl.c server/client.c $(COMMON_SRC)
 AGENT_SRC  = agent/main.c agent/jobs.c agent/osinfo.c $(COMMON_SRC)
 
 .PHONY: all warnings clean rebuild install-assets install-server test-local
@@ -40,6 +41,7 @@ clean:
 rebuild: clean all
 
 test-local: all
-	@echo "Run in two terminals:"
-	@echo "  ./nsimajd --secret nsimaj --assets ./bootstrap"
+	@echo "Run daemon + TUI + agent:"
+	@echo "  ./nsimajd --daemon --secret nsimaj --assets ./bootstrap -y"
+	@echo "  ./nsimajd"
 	@echo "  ./nsimaj-agent --server 127.0.0.1 --secret nsimaj"
