@@ -338,20 +338,46 @@ void fleet_mark_offline(struct fleet *f, struct agent *a)
         f->focus_agent = -1;
     a->online = 0;
     a->focusing = 0;
-    a->authenticated = 0;
+}
+
+void fleet_disconnect(struct fleet *f, struct agent *a)
+{
+    if (!a || !a->used)
+        return;
+    /* Never authenticated: drop the pending slot entirely. */
+    if (!a->authenticated) {
+        fleet_remove(f, a);
+        return;
+    }
+    char label[NSIMAJ_HOST_LEN];
+    snprintf(label, sizeof label, "%s",
+             a->hostname[0] ? a->hostname : (a->ip[0] ? a->ip : a->id));
+    if (a->fd >= 0) {
+        close(a->fd);
+        a->fd = -1;
+    }
+    frame_reader_free(&a->reader);
+    frame_reader_init(&a->reader);
+    fleet_mark_offline(f, a);
+    fleet_touch(f);
+    fleet_set_status(f, "Agent offline: %s", label);
 }
 
 void fleet_remove(struct fleet *f, struct agent *a)
 {
     if (!a || !a->used)
         return;
+    int idx = (int)(a - f->agents);
     if (a->fd >= 0) {
         close(a->fd);
         a->fd = -1;
     }
     frame_reader_free(&a->reader);
     fleet_mark_offline(f, a);
+    a->authenticated = 0;
     a->used = 0;
+    if (idx >= 0 && idx < NSIMAJ_MAX_AGENTS)
+        f->selected[idx] = 0;
     if (f->count > 0)
         f->count--;
     fleet_touch(f);
@@ -437,7 +463,48 @@ int fleet_handle_message(struct fleet *f, struct agent *a, const char *json)
             json_buf_free(&b);
             return -1;
         }
-        json_get_string(json, "id", a->id, sizeof a->id);
+
+        char new_id[NSIMAJ_ID_LEN];
+        new_id[0] = '\0';
+        json_get_string(json, "id", new_id, sizeof new_id);
+
+        int merged = 0;
+        /*
+         * Reuse the existing roster slot for this agent id. Move the new
+         * connection onto that slot and free the temporary pending row.
+         * Returns 2 so the caller stops using the pending pointer.
+         */
+        if (new_id[0]) {
+            struct agent *ex = fleet_find_id(f, new_id);
+            if (ex && ex != a) {
+                if (ex->fd >= 0 && ex->fd != a->fd) {
+                    close(ex->fd);
+                    ex->fd = -1;
+                }
+                frame_reader_free(&ex->reader);
+                ex->fd = a->fd;
+                ex->reader = a->reader;
+                snprintf(ex->ip, sizeof ex->ip, "%s", a->ip);
+
+                /* Detach pending without closing the transferred fd/reader. */
+                a->fd = -1;
+                memset(&a->reader, 0, sizeof a->reader);
+                a->authenticated = 0;
+                a->used = 0;
+                {
+                    int ai = (int)(a - f->agents);
+                    if (ai >= 0 && ai < NSIMAJ_MAX_AGENTS)
+                        f->selected[ai] = 0;
+                }
+                if (f->count > 0)
+                    f->count--;
+
+                a = ex;
+                merged = 1;
+            }
+        }
+
+        snprintf(a->id, sizeof a->id, "%s", new_id[0] ? new_id : a->id);
         json_get_string(json, "hostname", a->hostname, sizeof a->hostname);
         json_get_string(json, "distro", a->distro, sizeof a->distro);
         json_get_string(json, "family", a->family, sizeof a->family);
@@ -449,6 +516,8 @@ int fleet_handle_message(struct fleet *f, struct agent *a, const char *json)
         if (json_get_int(json, "pending_updates", &pend) == 0)
             a->pending_updates = (int)pend;
         a->authenticated = 1;
+        a->online = 1;
+        a->last_seen = util_now();
         fleet_touch(f);
         fleet_set_status(f, "Agent online: %s (%s)", a->hostname, a->ip);
 
@@ -458,7 +527,7 @@ int fleet_handle_message(struct fleet *f, struct agent *a, const char *json)
         json_buf_add_str(&b, "type", MSG_OK);
         send_json(a, &b);
         json_buf_free(&b);
-        return 0;
+        return merged ? 2 : 0;
     }
 
     if (!a->authenticated)
@@ -494,6 +563,14 @@ int fleet_handle_message(struct fleet *f, struct agent *a, const char *json)
         snprintf(line, sizeof line, "%s %s stage=%s exit=%ld", a->hostname,
                  a->job_id, a->job_stage, a->job_exit);
         fleet_save_history(f, line);
+        if (strcmp(a->job_stage, STAGE_FAILED) == 0) {
+            if (a->last_error[0])
+                fleet_set_status(f, "Failed on %s: %s", a->hostname,
+                                 a->last_error);
+            else
+                fleet_set_status(f, "Failed on %s (exit %ld)", a->hostname,
+                                 a->job_exit);
+        }
         fleet_touch(f);
         return 0;
     }
@@ -547,6 +624,10 @@ int fleet_start_job(struct fleet *f, const char *kind, const char *payload)
             a->job_exit = -1;
             a->last_error[0] = '\0';
             started++;
+        } else {
+            snprintf(a->last_error, sizeof a->last_error, "send failed");
+            snprintf(a->job_stage, sizeof a->job_stage, "%s", STAGE_FAILED);
+            fleet_set_status(f, "Send failed to %s", a->hostname);
         }
         json_buf_free(&b);
     }
@@ -555,7 +636,11 @@ int fleet_start_job(struct fleet *f, const char *kind, const char *payload)
     snprintf(hist, sizeof hist, "dispatch kind=%s job=%s hosts=%d", kind, job_id,
              started);
     fleet_save_history(f, hist);
-    fleet_set_status(f, "Started %s on %d host(s) [%s]", kind, started, job_id);
+    if (started > 0)
+        fleet_set_status(f, "Started %s on %d host(s) [%s]", kind, started,
+                         job_id);
+    else
+        fleet_set_status(f, "No hosts reached for %s", kind);
     return started;
 }
 

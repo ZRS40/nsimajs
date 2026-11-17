@@ -64,6 +64,8 @@ struct agent *fleet_find_id(struct fleet *f, const char *id);
 struct agent *fleet_find_fd(struct fleet *f, int fd);
 void fleet_remove(struct fleet *f, struct agent *a);
 void fleet_mark_offline(struct fleet *f, struct agent *a);
+/* Close fd and mark offline but keep the roster slot (authenticated agents). */
+void fleet_disconnect(struct fleet *f, struct agent *a);
 int fleet_online_count(const struct fleet *f);
 void fleet_clear_selection(struct fleet *f);
 int fleet_selected_count(const struct fleet *f);

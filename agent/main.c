@@ -314,7 +314,7 @@ int main(int argc, char **argv)
             NSIMAJ_VERSION, st.hostname, st.family, st.server_host,
             st.server_port);
 
-    int backoff_ms = 1000;
+    int backoff_ms = 200;
     long last_hb = 0;
     long last_job_poll = 0;
 
@@ -324,12 +324,12 @@ int main(int argc, char **argv)
                     st.server_port);
             if (connect_server(&st) < 0) {
                 util_sleep_ms(backoff_ms);
-                if (backoff_ms < 30000)
+                if (backoff_ms < 2000)
                     backoff_ms *= 2;
                 continue;
             }
             set_nonblock(st.fd);
-            backoff_ms = 1000;
+            backoff_ms = 200;
             last_hb = util_now();
             fprintf(stderr, "connected, waiting for orders\n");
         }

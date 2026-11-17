@@ -1,7 +1,9 @@
 #ifndef NSIMAJ_PROTOCOL_H
 #define NSIMAJ_PROTOCOL_H
 
+#ifndef NSIMAJ_VERSION
 #define NSIMAJ_VERSION "0.1.0"
+#endif
 
 #define NSIMAJ_CONTROL_PORT 7422
 #define NSIMAJ_HTTP_PORT    7421
@@ -17,8 +19,8 @@
 #define NSIMAJ_PATH_LEN     512
 #define NSIMAJ_CMD_LEN      4096
 
-#define NSIMAJ_HEARTBEAT_SEC 20
-#define NSIMAJ_OFFLINE_SEC   60
+#define NSIMAJ_HEARTBEAT_SEC 2
+#define NSIMAJ_OFFLINE_SEC   6
 
 /* Message type strings */
 #define MSG_HELLO        "hello"

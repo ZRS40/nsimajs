@@ -123,12 +123,12 @@ void tui_draw(struct fleet *f)
 
     n = snprintf(line, sizeof line,
                  "keys: j/k move  space select  a all  u update  e exec  "
-                 "c cancel  f focus  q quit  : cmd\r\n");
+                 "c cancel  f focus  S svc  q quit  : cmd\r\n");
     write(STDOUT_FILENO, line, (size_t)n);
 
     n = snprintf(line, sizeof line,
-                 "%-3s %-2s %-20s %-15s %-14s %5s %-12s %-10s\r\n",
-                 "#", "S", "HOST", "IP", "DISTRO", "UPD", "STAGE", "JOB");
+                 "%-3s %-2s %-18s %-14s %-10s %4s %-10s %-18s\r\n",
+                 "#", "S", "HOST", "IP", "DISTRO", "UPD", "STAGE", "ERR");
     write(STDOUT_FILENO, line, (size_t)n);
     write(STDOUT_FILENO, "----------------------------------------------------------------"
                          "--------------------\r\n",
@@ -147,20 +147,17 @@ void tui_draw(struct fleet *f)
             continue;
         int selected = f->selected[i];
         int is_cur = (row == f->cursor);
+        int failed = a->job_stage[0] && strcmp(a->job_stage, STAGE_FAILED) == 0;
         const char *on = a->online ? "on" : "off";
         char stage[NSIMAJ_STAGE_LEN];
         snprintf(stage, sizeof stage, "%s", a->job_stage[0] ? a->job_stage : "-");
-        char jobshort[16];
-        if (a->job_id[0])
-            snprintf(jobshort, sizeof jobshort, "%.10s", a->job_id);
-        else
-            snprintf(jobshort, sizeof jobshort, "-");
+        const char *err = a->last_error[0] ? a->last_error : "-";
+        const char *hi = is_cur ? "\033[7m" : (failed ? "\033[31m" : "");
 
         n = snprintf(line, sizeof line,
-                     "%s%-3d %c%-2s %-20.20s %-15.15s %-14.14s %5d %-12.12s %-10.10s\033[0m\r\n",
-                     is_cur ? "\033[7m" : "", row, selected ? '*' : ' ', on,
-                     a->hostname, a->ip, a->distro, a->pending_updates, stage,
-                     jobshort);
+                     "%s%-3d %c%-2s %-18.18s %-14.14s %-10.10s %4d %-10.10s %-18.18s\033[0m\r\n",
+                     hi, row, selected ? '*' : ' ', on, a->hostname, a->ip,
+                     a->distro, a->pending_updates, stage, err);
         write(STDOUT_FILENO, line, (size_t)n);
         row++;
         if (row >= rows - 6)
@@ -208,6 +205,13 @@ static void select_all(struct fleet *f)
     }
 }
 
+static void show_svc_help(struct fleet *f)
+{
+    fleet_set_status(f,
+                     "svc: systemctl status|restart nsimajd | "
+                     "start nsimajd-update | status nsimajd-update.timer");
+}
+
 static int run_cmdline(struct fleet *f)
 {
     if (strncmp(cmd_buf, "update", 6) == 0) {
@@ -222,6 +226,8 @@ static int run_cmdline(struct fleet *f)
         int idx = visible_index(f, n);
         if (idx >= 0 && fleet_focus(f, idx) == 0)
             tui_enter_focus(f);
+    } else if (strcmp(cmd_buf, "svc") == 0 || strcmp(cmd_buf, "service") == 0) {
+        show_svc_help(f);
     } else if (strcmp(cmd_buf, "quit") == 0 || strcmp(cmd_buf, "q") == 0) {
         f->running = 0;
     } else {
@@ -336,6 +342,10 @@ int tui_handle_input(struct fleet *f, unsigned char ch)
             fleet_set_status(f, "Cannot focus that agent");
         break;
     }
+    case 's':
+    case 'S':
+        show_svc_help(f);
+        break;
     case ':':
         cmd_mode = 1;
         cmd_len = 0;
