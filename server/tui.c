@@ -53,6 +53,11 @@ void tui_enter_focus_client(struct fleet *f, int ctl_fd)
     (void)f;
     focus_mode = 1;
     write(STDOUT_FILENO, "\033[2J\033[H\033[?25h", 12);
+    const char *hint =
+        "\r\n--- nsimaj focus (Ctrl-N to detach) ---\r\n"
+        "Watch for UPDATE COMPLETE; agent restarts a few seconds after.\r\n"
+        "----------------------------------------\r\n";
+    write(STDOUT_FILENO, hint, strlen(hint));
     int rows = 24, cols = 80;
     get_winsize(&rows, &cols);
     client_send_focus_resize(ctl_fd, rows, cols);
@@ -104,11 +109,17 @@ void tui_draw(struct fleet *f)
     write(STDOUT_FILENO, "\033[H\033[2J", 7);
 
     char line[512];
-    int n = snprintf(line, sizeof line,
+    int     n = snprintf(line, sizeof line,
                      "\033[1mnsimaj\033[0m control  v%s  |  online %d  |  "
                      "port %d  |  daemon\r\n",
                      NSIMAJ_VERSION, fleet_online_count(f), f->control_port);
     write(STDOUT_FILENO, line, (size_t)n);
+
+    if (f->update_banner[0]) {
+        n = snprintf(line, sizeof line, "\033[33m! %s\033[0m\r\n",
+                     f->update_banner);
+        write(STDOUT_FILENO, line, (size_t)n);
+    }
 
     n = snprintf(line, sizeof line,
                  "keys: j/k move  space select  a all  u update  e exec  "

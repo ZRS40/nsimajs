@@ -30,7 +30,9 @@ sudo ./bootstrap/install-server.sh
 
 Installs `/usr/local/bin/nsimajd`, enables `nsimajd.service` (daemon at boot —
 owns ports 7421/7422 and talks to agents), and a daily update timer. The script
-asks which Unix user owns the GitHub SSH key (saved in `/opt/nsimaj/.nsimaj-git-user`).
+asks which Unix user owns the GitHub SSH key (saved in `/opt/nsimaj/.nsimaj-git-user`),
+and copies that user’s `~/.config/nsimaj/server.conf` to **`/etc/nsimaj/server.conf`**
+so the root daemon uses the same join secret / advertise IP as your agents.
 
 ### Daily use
 

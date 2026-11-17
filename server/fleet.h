@@ -46,6 +46,8 @@ struct fleet {
     int running;
     int confirm_pending; /* 0 none, 1 agent package update, 2 server self-update */
     char status_line[256];
+    /* Set by TUI client when a newer server tag is available (empty if none). */
+    char update_banner[160];
     int selected[NSIMAJ_MAX_AGENTS];
     int cursor;
     int dirty; /* TUI should redraw */

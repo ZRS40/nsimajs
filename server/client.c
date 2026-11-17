@@ -9,13 +9,20 @@
 
 #include <errno.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/types.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+
+#define NSIMAJ_UPDATE_CHECK_FILE "/tmp/nsimaj-server-update-check"
+
+static pid_t g_update_check_pid = -1;
 
 int client_ensure_daemon(void)
 {
@@ -33,9 +40,12 @@ int client_ensure_daemon(void)
     }
     fprintf(stderr,
             "nsimajd daemon not available (%s missing).\n"
-            "Install/start with: sudo ./bootstrap/install-server.sh\n"
-            "Or: sudo systemctl start nsimajd\n",
-            NSIMAJ_CTL_SOCK);
+            "Often a stuck old process holds the ports. Try:\n"
+            "  sudo pkill -9 -x nsimajd\n"
+            "  sudo systemctl restart nsimajd\n"
+            "  ls -l %s\n"
+            "Then: nsimajd\n",
+            NSIMAJ_CTL_SOCK, NSIMAJ_CTL_SOCK);
     return -1;
 }
 
@@ -188,6 +198,110 @@ int client_send_focus_resize(int fd, int rows, int cols)
     return client_send_json(fd, buf);
 }
 
+static void update_check_child(void)
+{
+    const char *root = getenv("NSIMAJ_ROOT");
+    if (!root || !root[0])
+        root = "/opt/nsimaj";
+
+    char fetch[512];
+    snprintf(fetch, sizeof fetch,
+             "timeout 8 git -C '%s' fetch --tags origin >/dev/null 2>&1", root);
+    system(fetch);
+
+    char cur[128] = "";
+    char path[512];
+    snprintf(path, sizeof path, "%s/.nsimaj-last-good-tag", root);
+    if (util_read_file(path, cur, sizeof cur) >= 0)
+        util_trim(cur);
+    if (!cur[0]) {
+        char cmd[512];
+        snprintf(cmd, sizeof cmd,
+                 "git -C '%s' describe --tags --exact-match HEAD 2>/dev/null || "
+                 "git -C '%s' describe --tags --always HEAD 2>/dev/null",
+                 root, root);
+        FILE *fp = popen(cmd, "r");
+        if (fp) {
+            if (fgets(cur, sizeof cur, fp))
+                util_trim(cur);
+            pclose(fp);
+        }
+    }
+
+    char latest[128] = "";
+    {
+        char cmd[512];
+        snprintf(cmd, sizeof cmd,
+                 "git -C '%s' tag -l 'v*' --sort=-v:refname | head -1", root);
+        FILE *fp = popen(cmd, "r");
+        if (fp) {
+            if (fgets(latest, sizeof latest, fp))
+                util_trim(latest);
+            pclose(fp);
+        }
+    }
+
+    FILE *out = fopen(NSIMAJ_UPDATE_CHECK_FILE, "w");
+    if (!out)
+        _exit(0);
+    if (latest[0] && cur[0] && strcmp(latest, cur) != 0)
+        fprintf(out, "UPDATE_AVAILABLE %s %s\n", latest, cur);
+    else if (latest[0] && !cur[0])
+        fprintf(out, "UPDATE_AVAILABLE %s\n", latest);
+    else
+        fprintf(out, "OK\n");
+    fclose(out);
+    _exit(0);
+}
+
+void client_start_update_check(void)
+{
+    unlink(NSIMAJ_UPDATE_CHECK_FILE);
+    pid_t pid = fork();
+    if (pid < 0)
+        return;
+    if (pid > 0) {
+        g_update_check_pid = pid;
+        return;
+    }
+    update_check_child();
+}
+
+int client_poll_update_check(char *banner, size_t bannersz)
+{
+    if (!banner || bannersz == 0)
+        return 0;
+    banner[0] = '\0';
+
+    if (g_update_check_pid > 0) {
+        int st = 0;
+        pid_t r = waitpid(g_update_check_pid, &st, WNOHANG);
+        if (r == g_update_check_pid)
+            g_update_check_pid = -1;
+    }
+
+    char buf[256];
+    if (util_read_file(NSIMAJ_UPDATE_CHECK_FILE, buf, sizeof buf) < 0)
+        return 0;
+    util_trim(buf);
+    unlink(NSIMAJ_UPDATE_CHECK_FILE);
+
+    if (strncmp(buf, "UPDATE_AVAILABLE ", 17) == 0) {
+        char latest[64] = "";
+        char cur[64] = "";
+        sscanf(buf + 17, "%63s %63s", latest, cur);
+        if (cur[0])
+            snprintf(banner, bannersz,
+                     "Server update available: %s (now %s) — sudo nsimajd update",
+                     latest, cur);
+        else
+            snprintf(banner, bannersz,
+                     "Server update available: %s — sudo nsimajd update", latest);
+        return 1;
+    }
+    return 0;
+}
+
 /* ---- TUI client loop (actions go to daemon) ---- */
 
 int client_run_tui(void)
@@ -217,6 +331,8 @@ int client_run_tui(void)
         close(fd);
         return 1;
     }
+
+    client_start_update_check();
 
     tui_init();
     atexit(tui_restore);
@@ -260,9 +376,14 @@ int client_run_tui(void)
             while (flen > 0) {
                 char type[64];
                 if (json_get_string(frame, "type", type, sizeof type) == 0) {
-                    if (strcmp(type, "state") == 0)
+                    if (strcmp(type, "state") == 0) {
+                        char keep_banner[160];
+                        snprintf(keep_banner, sizeof keep_banner, "%s",
+                                 fleet.update_banner);
                         client_apply_state(&fleet, frame);
-                    else if (strcmp(type, "focus_data") == 0) {
+                        snprintf(fleet.update_banner, sizeof fleet.update_banner,
+                                 "%s", keep_banner);
+                    } else if (strcmp(type, "focus_data") == 0) {
                         char b64[NSIMAJ_MAX_FRAME];
                         if (json_get_string(frame, "data", b64, sizeof b64) == 0) {
                             unsigned char raw[NSIMAJ_MAX_FRAME];
@@ -282,6 +403,15 @@ int client_run_tui(void)
             }
         }
 
+        {
+            char banner[160];
+            if (client_poll_update_check(banner, sizeof banner) && banner[0]) {
+                snprintf(fleet.update_banner, sizeof fleet.update_banner, "%s",
+                         banner);
+                fleet.dirty = 1;
+            }
+        }
+
         struct timespec ts;
         clock_gettime(CLOCK_MONOTONIC, &ts);
         long now_ms = ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
@@ -290,6 +420,12 @@ int client_run_tui(void)
             fleet.dirty = 0;
             last_draw = now_ms;
         }
+    }
+
+    if (g_update_check_pid > 0) {
+        kill(g_update_check_pid, SIGTERM);
+        waitpid(g_update_check_pid, NULL, 0);
+        g_update_check_pid = -1;
     }
 
     tui_restore();

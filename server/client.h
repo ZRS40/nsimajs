@@ -27,4 +27,9 @@ int client_send_focus_resize(int fd, int rows, int cols);
 /* Interactive TUI attached to daemon. Returns process exit code. */
 int client_run_tui(void);
 
+/* Once-per-launch background check for newer server git tag. */
+void client_start_update_check(void);
+/* Non-blocking: if check finished and update available, fill banner. */
+int client_poll_update_check(char *banner, size_t bannersz);
+
 #endif

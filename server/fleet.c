@@ -38,8 +38,18 @@ void fleet_touch(struct fleet *f)
     f->dirty = 1;
 }
 
+/* System-wide config used by the root systemd daemon. */
+#define NSIMAJ_SYSTEM_CONF "/etc/nsimaj/server.conf"
+
 static int fleet_config_path(struct fleet *f, char *out, size_t sz)
 {
+    if (access(NSIMAJ_SYSTEM_CONF, R_OK) == 0 || geteuid() == 0) {
+        if ((size_t)snprintf(out, sz, "%s", NSIMAJ_SYSTEM_CONF) >= sz)
+            return -1;
+        if (f)
+            snprintf(f->config_path, sizeof f->config_path, "%s", out);
+        return 0;
+    }
     char dir[NSIMAJ_PATH_LEN];
     if (util_config_dir(dir, sizeof dir) < 0)
         return -1;
@@ -55,14 +65,55 @@ int fleet_config_ready(const struct fleet *f)
     return f->secret[0] && f->advertise_ip[0];
 }
 
+static int try_read_conf(const char *path, char *buf, size_t sz)
+{
+    return path && path[0] && util_read_file(path, buf, sz) >= 0 ? 0 : -1;
+}
+
 int fleet_load_config(struct fleet *f)
 {
     char path[NSIMAJ_PATH_LEN];
     char buf[4096];
-    if (fleet_config_path(f, path, sizeof path) < 0)
-        return -1;
-    if (util_read_file(path, buf, sizeof buf) < 0)
-        return -1;
+    path[0] = '\0';
+
+    if (try_read_conf(NSIMAJ_SYSTEM_CONF, buf, sizeof buf) == 0) {
+        snprintf(path, sizeof path, "%s", NSIMAJ_SYSTEM_CONF);
+    } else {
+        /* Fallbacks when /etc is missing (first boot / pre-install). */
+        const char *candidates[4];
+        int nc = 0;
+        const char *git_user = getenv("NSIMAJ_GIT_USER");
+        const char *sudo_user = getenv("SUDO_USER");
+        static char p0[NSIMAJ_PATH_LEN], p1[NSIMAJ_PATH_LEN], p2[NSIMAJ_PATH_LEN];
+        if (git_user && git_user[0] && strcmp(git_user, "root") != 0) {
+            snprintf(p0, sizeof p0, "/home/%s/.config/nsimaj/server.conf", git_user);
+            candidates[nc++] = p0;
+        }
+        if (sudo_user && sudo_user[0] && strcmp(sudo_user, "root") != 0) {
+            snprintf(p1, sizeof p1, "/home/%s/.config/nsimaj/server.conf", sudo_user);
+            candidates[nc++] = p1;
+        }
+        {
+            char dir[NSIMAJ_PATH_LEN];
+            if (util_config_dir(dir, sizeof dir) == 0) {
+                snprintf(p2, sizeof p2, "%s/server.conf", dir);
+                candidates[nc++] = p2;
+            }
+        }
+        int found = 0;
+        for (int i = 0; i < nc; i++) {
+            if (try_read_conf(candidates[i], buf, sizeof buf) == 0) {
+                snprintf(path, sizeof path, "%s", candidates[i]);
+                found = 1;
+                break;
+            }
+        }
+        if (!found)
+            return -1;
+    }
+    if (f)
+        snprintf(f->config_path, sizeof f->config_path, "%s", path);
+    fprintf(stderr, "Loaded config from %s\n", path);
     char *line = buf;
     while (line && *line) {
         char *nl = strchr(line, '\n');
@@ -101,11 +152,6 @@ int fleet_load_config(struct fleet *f)
 int fleet_save_config(const struct fleet *f)
 {
     char path[NSIMAJ_PATH_LEN];
-    char dir[NSIMAJ_PATH_LEN];
-    if (util_config_dir(dir, sizeof dir) < 0)
-        return -1;
-    if ((size_t)snprintf(path, sizeof path, "%s/server.conf", dir) >= sizeof path)
-        return -1;
     char body[1024];
     snprintf(body, sizeof body,
              "secret=%s\n"
@@ -116,11 +162,25 @@ int fleet_save_config(const struct fleet *f)
              "iface=%s\n",
              f->secret, f->control_port, f->http_port, f->bind_addr,
              f->advertise_ip, f->iface);
-    if (util_write_file(path, body, 0600) < 0) {
-        fprintf(stderr, "[nsimaj] failed to write %s\n", path);
-        return -1;
+
+    int ok = 0;
+    if (geteuid() == 0) {
+        util_mkdir_p("/etc/nsimaj", 0755);
+        if (util_write_file(NSIMAJ_SYSTEM_CONF, body, 0600) == 0)
+            ok = 1;
+        else
+            fprintf(stderr, "[nsimaj] failed to write %s\n", NSIMAJ_SYSTEM_CONF);
     }
-    return 0;
+    char dir[NSIMAJ_PATH_LEN];
+    if (util_config_dir(dir, sizeof dir) == 0) {
+        if ((size_t)snprintf(path, sizeof path, "%s/server.conf", dir) < sizeof path) {
+            if (util_write_file(path, body, 0600) == 0)
+                ok = 1;
+            else
+                fprintf(stderr, "[nsimaj] failed to write %s\n", path);
+        }
+    }
+    return ok ? 0 : -1;
 }
 
 #define MAX_IFACES 32
@@ -570,6 +630,18 @@ int fleet_handle_message(struct fleet *f, struct agent *a, const char *json)
             else
                 fleet_set_status(f, "Failed on %s (exit %ld)", a->hostname,
                                  a->job_exit);
+        } else if (strcmp(a->job_stage, STAGE_DONE) == 0) {
+            fleet_set_status(f, "Done on %s — update finished OK", a->hostname);
+        } else if (strcmp(a->job_stage, "installing_agent") == 0) {
+            fleet_set_status(f, "%s: refreshing agent binary…", a->hostname);
+        } else if (strcmp(a->job_stage, STAGE_UPGRADING) == 0) {
+            fleet_set_status(f, "%s: upgrading packages…", a->hostname);
+        } else if (strcmp(a->job_stage, STAGE_UPDATING_INDEXES) == 0) {
+            fleet_set_status(f, "%s: refreshing package indexes…", a->hostname);
+        } else if (strcmp(a->job_stage, STAGE_PREPARING) == 0) {
+            fleet_set_status(f, "%s: preparing…", a->hostname);
+        } else if (a->job_stage[0]) {
+            fleet_set_status(f, "%s: %s", a->hostname, a->job_stage);
         }
         fleet_touch(f);
         return 0;

@@ -98,6 +98,26 @@ chown -R "$git_user":"$git_user" "$DEST"
 install -m 0755 "$DEST/nsimajd" /usr/local/bin/nsimajd
 echo "Installed /usr/local/bin/nsimajd"
 
+# Daemon (root) must use the same secret/IP as agents — not ~/.config of root.
+mkdir -p /etc/nsimaj
+user_conf="/home/$git_user/.config/nsimaj/server.conf"
+if [[ -f "$user_conf" ]]; then
+  install -m 0600 "$user_conf" /etc/nsimaj/server.conf
+  echo "Installed /etc/nsimaj/server.conf from $user_conf"
+elif [[ ! -f /etc/nsimaj/server.conf ]]; then
+  adv=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
+  cat >/etc/nsimaj/server.conf <<CFGEOF
+secret=nsimaj
+port=7422
+http_port=7421
+bind=0.0.0.0
+advertise_ip=${adv:-}
+iface=
+CFGEOF
+  chmod 0600 /etc/nsimaj/server.conf
+  echo "Created /etc/nsimaj/server.conf (edit secret/advertise_ip if needed)"
+fi
+
 chmod +x "$DEST/bootstrap/install.sh" \
   "$DEST/bootstrap/nsimajd-update.sh" \
   "$DEST/bootstrap/install-server.sh"
@@ -112,8 +132,22 @@ for unit in nsimajd.service nsimajd-update.service nsimajd-update.timer; do
 done
 
 systemctl daemon-reload
+# Drop any leftover binary (old --headless) that still holds the ports.
+systemctl stop nsimajd.service 2>/dev/null || true
+pkill -x nsimajd 2>/dev/null || true
+sleep 1
+pkill -9 -x nsimajd 2>/dev/null || true
 systemctl enable --now nsimajd.service
 systemctl enable --now nsimajd-update.timer
+# Confirm control socket appeared.
+for i in 1 2 3 4 5 6 7 8 9 10; do
+  [[ -S /run/nsimajd.sock ]] && break
+  sleep 0.3
+done
+if [[ ! -S /run/nsimajd.sock ]]; then
+  echo "WARN: /run/nsimajd.sock missing after start — check: journalctl -u nsimajd -n 50" >&2
+  systemctl status nsimajd --no-pager -l || true
+fi
 
 tag=$(git_as_user git -C "$DEST" describe --tags --always 2>/dev/null || echo unknown)
 echo "$tag" >"$DEST/.nsimaj-last-good-tag"

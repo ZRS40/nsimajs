@@ -137,22 +137,37 @@ int agent_job_start(struct agent_state *st, const char *job_id, const char *kind
         fprintf(sf, "export TERM=\"${TERM:-xterm-256color}\"\n");
         fprintf(sf, "exec /bin/bash -l\n");
     } else if (strcmp(kind, JOB_KIND_UPDATE) == 0) {
+        fprintf(sf, "echo\n");
+        fprintf(sf, "echo '======== nsimaj PACKAGE UPDATE ========'\n");
+        fprintf(sf, "echo \"host=$(hostname 2>/dev/null || cat /etc/hostname) "
+                    "family=%s\"\n",
+                st->family);
+        fprintf(sf, "echo '======================================='\n");
+        fprintf(sf, "echo\n");
         if (strcmp(st->family, "arch") == 0) {
+            fprintf(sf, "echo '>>> [1/3] Refreshing package indexes (pacman -Sy)...'\n");
             fprintf(sf, "echo updating_indexes > \"$STAGE_FILE\"\n");
             fprintf(sf, "pacman -Sy --noconfirm\n");
+            fprintf(sf, "echo '>>> [2/3] Upgrading packages (pacman -Su)...'\n");
             fprintf(sf, "echo upgrading > \"$STAGE_FILE\"\n");
             fprintf(sf, "pacman -Su --noconfirm\n");
         } else if (strcmp(st->family, "debian") == 0) {
+            fprintf(sf, "echo '>>> [1/3] Refreshing package indexes (apt-get update)...'\n");
             fprintf(sf, "echo updating_indexes > \"$STAGE_FILE\"\n");
             fprintf(sf, "export DEBIAN_FRONTEND=noninteractive\n");
             fprintf(sf, "apt-get update\n");
+            fprintf(sf, "echo '>>> [2/3] Upgrading packages (apt-get upgrade)...'\n");
             fprintf(sf, "echo upgrading > \"$STAGE_FILE\"\n");
             fprintf(sf, "apt-get -y upgrade\n");
         } else {
             fprintf(sf, "echo 'unsupported distro family' >&2\nexit 2\n");
         }
         fprintf(sf, "ec_pkg=$?\n");
-        fprintf(sf, "echo 'Updating nsimaj agent from server...'\n");
+        fprintf(sf, "echo\n");
+        fprintf(sf, "echo \">>> package step finished (exit $ec_pkg)\"\n");
+        fprintf(sf, "echo installing_agent > \"$STAGE_FILE\"\n");
+        fprintf(sf, "sync\n");
+        fprintf(sf, "echo '>>> [3/3] Refreshing nsimaj-agent binary from server...'\n");
         fprintf(sf, "NSIMAJ_SRV='%s'\n", st->server_host);
         fprintf(sf, "NSIMAJ_HTTP='%d'\n",
                 st->http_port > 0 ? st->http_port : NSIMAJ_HTTP_PORT);
@@ -164,13 +179,26 @@ int agent_job_start(struct agent_state *st, const char *job_id, const char *kind
                 "curl -fsSL \"http://${NSIMAJ_SRV}:${NSIMAJ_HTTP}/nsimaj-agent.service\" "
                 "-o /etc/systemd/system/nsimaj-agent.service 2>/dev/null || true; "
                 "systemctl daemon-reload 2>/dev/null || true; "
-                "echo 'nsimaj-agent binary updated'; "
-                "else echo 'warning: could not download new nsimaj-agent' >&2; fi; "
+                "echo '>>> nsimaj-agent binary installed OK'; "
+                "else echo '>>> WARNING: could not download new nsimaj-agent' >&2; fi; "
                 "rm -f \"$AGTMP\"\n");
         fprintf(sf, "ec=$ec_pkg\n");
         fprintf(sf, "if [ \"$ec\" -eq 0 ]; then echo done > \"$STAGE_FILE\"; "
                     "else echo failed > \"$STAGE_FILE\"; fi\n");
-        fprintf(sf, "systemctl restart nsimaj-agent 2>/dev/null || true\n");
+        fprintf(sf, "sync\n");
+        fprintf(sf, "echo\n");
+        fprintf(sf,
+                "if [ \"$ec\" -eq 0 ]; then "
+                "echo '======== UPDATE COMPLETE (success) ========'; "
+                "else "
+                "echo '======== UPDATE FINISHED WITH ERRORS (exit '"
+                "\"$ec\") ========'; fi\n");
+        fprintf(sf, "echo 'Scheduling agent restart in 3s "
+                    "(so nsimajd can receive done first).'\n");
+        fprintf(sf, "echo 'Press Ctrl-N in nsimajd to detach if needed.'\n");
+        /* Background restart so this process can exit and agent_job_poll
+         * can report done/failed before the agent binary is killed. */
+        fprintf(sf, "( sleep 3; systemctl restart nsimaj-agent ) &\n");
         fprintf(sf, "exit \"$ec\"\n");
     } else if (strcmp(kind, JOB_KIND_EXEC) == 0) {
         fprintf(sf, "echo running > \"$STAGE_FILE\"\n");
@@ -274,20 +302,27 @@ void agent_job_poll(struct agent_state *st)
     if (util_read_file(stage_file, stage, sizeof stage) >= 0) {
         util_trim(stage);
         if (stage[0] && strcmp(stage, st->job_stage) != 0) {
-            if (strcmp(stage, "done") == 0)
+            if (strcmp(stage, "done") == 0) {
                 send_stage(st, STAGE_DONE, 0, NULL);
-            else if (strcmp(stage, "failed") == 0)
+                st->job_active = 0;
+            } else if (strcmp(stage, "failed") == 0) {
                 send_stage(st, STAGE_FAILED, 1, "job failed");
-            else if (strcmp(stage, "upgrading") == 0)
+                st->job_active = 0;
+            } else if (strcmp(stage, "upgrading") == 0)
                 send_stage(st, STAGE_UPGRADING, -1, NULL);
             else if (strcmp(stage, "updating_indexes") == 0)
                 send_stage(st, STAGE_UPDATING_INDEXES, -1, NULL);
+            else if (strcmp(stage, "installing_agent") == 0)
+                send_stage(st, "installing_agent", -1, NULL);
             else if (strcmp(stage, "running") == 0)
                 send_stage(st, STAGE_RUNNING, -1, NULL);
             else
                 send_stage(st, stage, -1, NULL);
         }
     }
+
+    if (!st->job_active)
+        return;
 
     int alive = 0;
     char check[256];
