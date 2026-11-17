@@ -368,6 +368,15 @@ static void start_all(const struct config *config, const struct hosts *hosts,
             fprintf(stderr, "cannot start SSH for host %zu\n", i + 1);
 }
 
+static void start_one(const struct config *config, const struct host *host,
+                      const char *command, int sudo, struct job *job)
+{
+
+
+    if (start_ssh(config, host, command, sudo, job) < 0)
+        fprintf(stderr, "cannot start SSH for host %s\n", job->ip);
+}
+
 static void show_log(const char *ip)
 {
     char path[PATH_MAX], buffer[512];
@@ -527,13 +536,24 @@ void ssh_console(const struct hosts *hosts)
         } else if (!strcmp(input, "back")) {
             watch[0] = '\0';
             focused_pid = 0;
-        } else if (!strcmp(input, "update")) {
+        } else if (!strncmp(input, "update", 6)) {
             if (!*config.sudo_password &&
                 ask_value("Sudo password: ", config.sudo_password,
                           sizeof config.sudo_password) < 0)
                 continue;
             save_config(&config);
-            start_all(&config, hosts, update_command, 1, jobs);
+
+            if (!strcmp(input + 7, "all") || !strcmp(input, "update")) {
+                start_all(&config, hosts, update_command, 1, jobs);
+            } else {
+
+                for (size_t i = 0; i < hosts->count; i++)
+                    if (!strcmp(input + 7, jobs[i].ip)) {
+                        start_one(&config, &hosts->items[i], update_command, 1, &jobs[0]);
+                        break;
+                    }
+            }
+
         } else if (!strncmp(input, "exec ", 5) && input[5]) {
             start_all(&config, hosts, input + 5, 0, jobs);
         } else if (*input) {
