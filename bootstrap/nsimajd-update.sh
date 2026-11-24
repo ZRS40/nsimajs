@@ -1,7 +1,7 @@
 #!/bin/bash
-# Update nsimajd from the latest git tag (v*), rebuild, restart.
-# On make failure: roll back to the previous known-good tag and keep running.
-# Git/SSH runs as the user recorded at install (.nsimaj-git-user).
+# Update nsimajd from the existing checkout at /opt/nsimaj (git pull + make).
+# Never re-clones. Git/SSH runs as the user recorded at install (.nsimaj-git-user).
+# On make failure: roll back to the previous known-good commit and keep running.
 set -euo pipefail
 
 ROOT="${NSIMAJ_ROOT:-/opt/nsimaj}"
@@ -26,9 +26,14 @@ fi
 
 git_as_user() {
   if [[ "$(id -u)" -eq 0 ]] && [[ "$git_user" != "root" ]] && id "$git_user" >/dev/null 2>&1; then
-    local home
+    local home sock
     home=$(getent passwd "$git_user" | cut -d: -f6)
-    sudo -u "$git_user" -H env "HOME=$home" "$@"
+    sock="${SSH_AUTH_SOCK:-}"
+    if [[ -n "$sock" && -S "$sock" ]]; then
+      sudo -u "$git_user" -H env "HOME=$home" "SSH_AUTH_SOCK=$sock" "$@"
+    else
+      sudo -u "$git_user" -H env "HOME=$home" "$@"
+    fi
   else
     "$@"
   fi
@@ -45,42 +50,58 @@ fi
 git_err=$(mktemp)
 if ! git_as_user git rev-parse --git-dir >"$git_err" 2>&1; then
   log "ERROR: $ROOT is not a usable git checkout (as $git_user): $(tr '\n' ' ' <"$git_err")"
+  log "HINT: install with bootstrap/install-server.sh (clone once), then update via git pull here"
   rm -f "$git_err"
   exit 1
 fi
 rm -f "$git_err"
 
+# Prefer SSH remote — curl/https to github.com often fails where git@ works.
+origin_url=$(git_as_user git remote get-url origin 2>/dev/null || true)
+if [[ "$origin_url" == https://github.com/* ]]; then
+  ssh_url="git@github.com:${origin_url#https://github.com/}"
+  ssh_url="${ssh_url%.git}.git"
+  log "switching origin from HTTPS to SSH: $ssh_url"
+  git_as_user git remote set-url origin "$ssh_url" || true
+fi
+
 prev=""
 if [[ -f "$GOOD_FILE" ]]; then
-  prev=$(cat "$GOOD_FILE")
-elif git_as_user git describe --tags --exact-match HEAD >/dev/null 2>&1; then
-  prev=$(git_as_user git describe --tags --exact-match HEAD)
-else
-  prev=$(git_as_user git describe --tags --always HEAD 2>/dev/null || true)
+  prev=$(tr -d '[:space:]' <"$GOOD_FILE")
+fi
+if [[ -z "$prev" ]]; then
+  prev=$(git_as_user git rev-parse --short HEAD 2>/dev/null || true)
+fi
+prev_full=$(git_as_user git rev-parse HEAD 2>/dev/null || true)
+
+branch=$(git_as_user git rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)
+if [[ "$branch" == "HEAD" ]]; then
+  branch=$(git_as_user git rev-parse --abbrev-ref origin/HEAD 2>/dev/null | sed 's#.*/##' || echo main)
+  log "detached HEAD — checking out $branch"
+  git_as_user git checkout -q "$branch" || git_as_user git checkout -q -B "$branch" "origin/$branch"
 fi
 
-log "fetching tags as $git_user (previous good: ${prev:-none})"
-if ! git_as_user git fetch --tags origin; then
-  log "ERROR: git fetch failed (check SSH key for user $git_user)"
-  exit 1
-fi
-
-latest=$(git_as_user git tag -l 'v*' --sort=-v:refname | head -1 || true)
-if [[ -z "$latest" ]]; then
-  log "no v* tags found; trying origin/HEAD"
-  latest=$(git_as_user git rev-parse --abbrev-ref origin/HEAD 2>/dev/null | sed 's#.*/##' || echo main)
-  git_as_user git checkout -q "$latest"
-  git_as_user git pull --ff-only origin "$latest" || true
-else
-  log "latest tag: $latest"
-  if [[ -n "$prev" && "$prev" == "$latest" ]]; then
-    if [[ -x "$ROOT/nsimajd" ]]; then
-      log "already on $latest — nothing to do"
-      exit 0
-    fi
+log "git pull in $ROOT as $git_user (branch=$branch, previous good: ${prev:-none})"
+pull_err=$(mktemp)
+if ! git_as_user git pull --ff-only origin "$branch" >"$pull_err" 2>&1; then
+  log "ff-only pull blocked or failed: $(tr '\n' ' ' <"$pull_err")"
+  log "fetch + hard reset to origin/$branch (deploy tree)"
+  if ! git_as_user git fetch origin "$branch" >>"$pull_err" 2>&1; then
+    log "ERROR: git fetch failed (as $git_user): $(tr '\n' ' ' <"$pull_err")"
+    log "HINT: interactive 'git -C $ROOT pull' as $git_user should work with the same SSH key"
+    rm -f "$pull_err"
+    exit 1
   fi
-  git_as_user git checkout -q "$latest"
+  git_as_user git reset --hard "origin/$branch" >>"$pull_err" 2>&1 || {
+    log "ERROR: reset failed: $(tr '\n' ' ' <"$pull_err")"
+    rm -f "$pull_err"
+    exit 1
+  }
 fi
+rm -f "$pull_err"
+
+latest=$(git_as_user git describe --tags --always --dirty 2>/dev/null || git_as_user git rev-parse --short HEAD)
+log "tree now at $latest"
 
 install_bin() {
   if [[ -x "$ROOT/nsimajd" ]]; then
@@ -103,20 +124,20 @@ if make -C "$ROOT"; then
   else
     log "nsimajd.service not installed; binary updated only"
   fi
-  log "update complete: $latest ($(git_as_user git describe --tags --always --dirty))"
+  log "update complete: $latest"
   exit 0
 fi
 
-log "ERROR: make failed on $latest — rolling back to ${prev:-unknown}"
-if [[ -n "$prev" ]]; then
-  git_as_user git checkout -q "$prev" || true
+log "ERROR: make failed on $latest — rolling back to ${prev_full:-$prev}"
+if [[ -n "$prev_full" ]]; then
+  git_as_user git reset --hard "$prev_full" || true
   if make -C "$ROOT"; then
     if id "$git_user" >/dev/null 2>&1 && [[ "$git_user" != "root" ]]; then
       chown -R "$git_user":"$git_user" "$ROOT" 2>/dev/null || true
     fi
     install_bin
-    echo "$prev" >"$GOOD_FILE"
-    log "rollback build ok — staying on $prev"
+    echo "${prev:-$prev_full}" >"$GOOD_FILE"
+    log "rollback build ok — staying on ${prev:-$prev_full}"
     if systemctl cat nsimajd >/dev/null 2>&1; then
       systemctl restart nsimajd || true
     fi

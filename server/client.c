@@ -218,9 +218,14 @@ static void update_check_child(void)
     if (!root || !root[0])
         root = "/opt/nsimaj";
 
-    char fetch[512];
+    /* In-place fetch only (existing clone). Prefer git user from install. */
+    char fetch[640];
     snprintf(fetch, sizeof fetch,
-             "timeout 8 git -C '%s' fetch --tags origin >/dev/null 2>&1", root);
+             "timeout 15 git -C '%s' fetch origin >/dev/null 2>&1 || "
+             "timeout 15 sudo -u \"$(tr -d '[:space:]' <'%s/.nsimaj-git-user' "
+             "2>/dev/null || echo paul)\" -H git -C '%s' fetch origin "
+             ">/dev/null 2>&1 || true",
+             root, root, root);
     system(fetch);
 
     char cur[128] = "";
