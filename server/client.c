@@ -126,15 +126,21 @@ void client_apply_state(struct fleet *f, const char *json)
         json_get_string(json, k, a->job_stage, sizeof a->job_stage);
         snprintf(k, sizeof k, "err%d", i);
         json_get_string(json, k, a->last_error, sizeof a->last_error);
-        long on = 0, upd = 0, sel = 0;
+        long on = 0, upd = 0, sel = 0, last = 0, qlen = 0;
         snprintf(k, sizeof k, "on%d", i);
         json_get_int(json, k, &on);
         snprintf(k, sizeof k, "upd%d", i);
         json_get_int(json, k, &upd);
         snprintf(k, sizeof k, "sel%d", i);
         json_get_int(json, k, &sel);
+        snprintf(k, sizeof k, "last%d", i);
+        json_get_int(json, k, &last);
+        snprintf(k, sizeof k, "q%d", i);
+        json_get_int(json, k, &qlen);
         a->online = (int)on;
         a->pending_updates = (int)upd;
+        a->last_update_at = last;
+        a->queue_len = (int)qlen;
         f->selected[slot] = sel ? 1 : 0;
         f->count++;
     }
@@ -401,12 +407,19 @@ int client_run_tui(void)
                             unsigned char raw[NSIMAJ_MAX_FRAME];
                             ssize_t dn = b64_decode(b64, raw, sizeof raw);
                             if (dn > 0)
-                                tui_write_focus(raw, (size_t)dn);
+                                tui_on_focus_data(&fleet, fd, raw, (size_t)dn);
                         }
                     } else if (strcmp(type, "error") == 0) {
                         char err[128];
-                        if (json_get_string(frame, "error", err, sizeof err) == 0)
-                            fleet_set_status(&fleet, "error: %s", err);
+                        if (json_get_string(frame, "error", err, sizeof err) == 0) {
+                            if (strcmp(err, "focus_failed") == 0 &&
+                                tui_in_attach())
+                                tui_cancel_attach(&fleet,
+                                                  "Focus failed — agent offline "
+                                                  "or unreachable");
+                            else
+                                fleet_set_status(&fleet, "error: %s", err);
+                        }
                     }
                 }
                 free(frame);
@@ -424,10 +437,13 @@ int client_run_tui(void)
             }
         }
 
+        tui_attach_tick(&fleet, fd);
+
         struct timespec ts;
         clock_gettime(CLOCK_MONOTONIC, &ts);
         long now_ms = ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
-        if (!tui_in_focus() && (fleet.dirty || now_ms - last_draw >= 250)) {
+        if (!tui_in_focus() &&
+            (fleet.dirty || tui_in_attach() || now_ms - last_draw >= 250)) {
             tui_draw(&fleet);
             fleet.dirty = 0;
             last_draw = now_ms;

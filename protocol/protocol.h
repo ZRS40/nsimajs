@@ -20,7 +20,9 @@
 #define NSIMAJ_CMD_LEN      4096
 
 #define NSIMAJ_HEARTBEAT_SEC 2
-#define NSIMAJ_OFFLINE_SEC   6
+#define NSIMAJ_OFFLINE_SEC   30
+
+#define NSIMAJ_QUEUE_CAP     8
 
 /* Message type strings */
 #define MSG_HELLO        "hello"

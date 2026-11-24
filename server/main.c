@@ -9,6 +9,7 @@
 #include "../common/firewall.h"
 #include "../common/frame.h"
 #include "../common/json.h"
+#include "../common/log.h"
 #include "../common/util.h"
 #include "../protocol/protocol.h"
 
@@ -202,6 +203,18 @@ static int run_daemon(struct fleet *fleet)
 
     firewall_allow_tcp(fleet->control_port, "nsimaj-control");
     firewall_allow_tcp(fleet->http_port, "nsimaj-bootstrap");
+
+    if (nsimaj_log_open("/var/log/nsimaj/nsimajd.log") < 0) {
+        char path[NSIMAJ_PATH_LEN];
+        if (util_config_dir(path, sizeof path) == 0) {
+            size_t n = strlen(path);
+            snprintf(path + n, sizeof path - n, "/nsimajd.log");
+            nsimaj_log_open(path);
+        }
+    }
+    nsimaj_log_info("nsimajd daemon start v%s control=%d http=%d ctl=%s",
+                    NSIMAJ_VERSION, fleet->control_port, fleet->http_port,
+                    NSIMAJ_CTL_SOCK);
 
     fprintf(stderr, "nsimajd daemon on :%d (http :%d) ctl=%s advertise=%s\n",
             fleet->control_port, fleet->http_port, NSIMAJ_CTL_SOCK,

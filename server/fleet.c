@@ -3,6 +3,7 @@
 
 #include "../common/firewall.h"
 #include "../common/json.h"
+#include "../common/log.h"
 #include "../common/util.h"
 
 #include <arpa/inet.h>
@@ -12,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 
 void fleet_init(struct fleet *f)
@@ -421,6 +423,7 @@ void fleet_disconnect(struct fleet *f, struct agent *a)
     fleet_mark_offline(f, a);
     fleet_touch(f);
     fleet_set_status(f, "Agent offline: %s", label);
+    nsimaj_log_warn("agent offline host=%s", label);
 }
 
 void fleet_remove(struct fleet *f, struct agent *a)
@@ -475,6 +478,147 @@ void fleet_set_status(struct fleet *f, const char *fmt, ...)
     fleet_touch(f);
 }
 
+int fleet_agent_job_busy(const struct agent *a)
+{
+    if (!a || !a->job_id[0] || !a->job_stage[0])
+        return 0;
+    if (strcmp(a->job_stage, STAGE_DONE) == 0 ||
+        strcmp(a->job_stage, STAGE_FAILED) == 0 ||
+        strcmp(a->job_stage, STAGE_CANCELLED) == 0 ||
+        strcmp(a->job_stage, "-") == 0)
+        return 0;
+    return 1;
+}
+
+int fleet_visible_sorted(struct fleet *f, int *idxs, int max)
+{
+    int n = 0;
+    if (!f || !idxs || max <= 0)
+        return 0;
+    for (int i = 0; i < NSIMAJ_MAX_AGENTS; i++) {
+        if (!f->agents[i].used || !f->agents[i].authenticated)
+            continue;
+        if (n < max)
+            idxs[n] = i;
+        n++;
+    }
+    if (n > max)
+        n = max;
+    for (int i = 1; i < n; i++) {
+        int key = idxs[i];
+        int j = i - 1;
+        while (j >= 0 &&
+               strcasecmp(f->agents[idxs[j]].hostname,
+                          f->agents[key].hostname) > 0) {
+            idxs[j + 1] = idxs[j];
+            j--;
+        }
+        idxs[j + 1] = key;
+    }
+    return n;
+}
+
+void fleet_queue_clear(struct agent *a)
+{
+    if (!a)
+        return;
+    a->queue_len = 0;
+    a->queue_head = 0;
+    memset(a->queue, 0, sizeof a->queue);
+}
+
+static int queue_enqueue(struct agent *a, const char *kind, const char *payload)
+{
+    if (!a || a->queue_len >= NSIMAJ_QUEUE_CAP)
+        return -1;
+    int idx = (a->queue_head + a->queue_len) % NSIMAJ_QUEUE_CAP;
+    struct pending_job *pj = &a->queue[idx];
+    snprintf(pj->kind, sizeof pj->kind, "%s", kind ? kind : JOB_KIND_UPDATE);
+    pj->payload[0] = '\0';
+    if (payload && payload[0])
+        snprintf(pj->payload, sizeof pj->payload, "%s", payload);
+    pj->queued_at = util_now();
+    a->queue_len++;
+    return 0;
+}
+
+static int queue_dequeue(struct agent *a, char *kind, size_t kind_sz,
+                         char *payload, size_t payload_sz)
+{
+    if (!a || a->queue_len <= 0)
+        return -1;
+    struct pending_job *pj = &a->queue[a->queue_head];
+    if (kind && kind_sz)
+        snprintf(kind, kind_sz, "%s", pj->kind);
+    if (payload && payload_sz)
+        snprintf(payload, payload_sz, "%s", pj->payload);
+    memset(pj, 0, sizeof *pj);
+    a->queue_head = (a->queue_head + 1) % NSIMAJ_QUEUE_CAP;
+    a->queue_len--;
+    return 0;
+}
+
+static int dispatch_job_to_agent(struct fleet *f, struct agent *a,
+                                 const char *kind, const char *payload,
+                                 const char *job_id)
+{
+    if (!a || !a->online || a->fd < 0)
+        return -1;
+    struct json_buf b;
+    if (json_buf_init(&b, 1024) < 0)
+        return -1;
+    json_buf_printf(&b, "{");
+    json_buf_add_str(&b, "type", MSG_JOB_START);
+    json_buf_add_str(&b, "job_id", job_id);
+    json_buf_add_str(&b, "kind", kind);
+    if (payload && payload[0])
+        json_buf_add_str(&b, "payload", payload);
+    if (json_buf_printf(&b, "}") < 0) {
+        json_buf_free(&b);
+        return -1;
+    }
+    int rc = frame_send_str(a->fd, b.data);
+    json_buf_free(&b);
+    if (rc != 0) {
+        snprintf(a->last_error, sizeof a->last_error, "send failed");
+        snprintf(a->job_stage, sizeof a->job_stage, "%s", STAGE_FAILED);
+        nsimaj_log_error("job send failed host=%s kind=%s job=%s", a->hostname,
+                         kind, job_id);
+        fleet_set_status(f, "Send failed to %s", a->hostname);
+        return -1;
+    }
+    snprintf(a->job_id, sizeof a->job_id, "%s", job_id);
+    snprintf(a->job_kind, sizeof a->job_kind, "%s", kind);
+    snprintf(a->job_stage, sizeof a->job_stage, "%s", STAGE_QUEUED);
+    a->job_exit = -1;
+    a->last_error[0] = '\0';
+    nsimaj_log_info("job started host=%s kind=%s job=%s", a->hostname, kind,
+                    job_id);
+    return 0;
+}
+
+int fleet_flush_queue(struct fleet *f, struct agent *a)
+{
+    if (!f || !a || !a->used || !a->authenticated || !a->online)
+        return 0;
+    if (fleet_agent_job_busy(a) || a->queue_len <= 0)
+        return 0;
+    char kind[32];
+    char payload[NSIMAJ_QUEUE_PAYLOAD];
+    if (queue_dequeue(a, kind, sizeof kind, payload, sizeof payload) < 0)
+        return 0;
+    char job_id[NSIMAJ_ID_LEN];
+    util_gen_id(job_id, sizeof job_id);
+    nsimaj_log_info("flush queue host=%s kind=%s remaining=%d", a->hostname,
+                    kind, a->queue_len);
+    if (dispatch_job_to_agent(f, a, kind, payload[0] ? payload : NULL, job_id) <
+        0)
+        return -1;
+    fleet_set_status(f, "Dequeued %s for %s (%d pending)", kind, a->hostname,
+                     a->queue_len);
+    return 1;
+}
+
 int fleet_save_history(struct fleet *f, const char *line)
 {
     (void)f;
@@ -514,6 +658,7 @@ int fleet_handle_message(struct fleet *f, struct agent *a, const char *json)
         char secret[NSIMAJ_SECRET_LEN];
         if (json_get_string(json, "secret", secret, sizeof secret) < 0 ||
             strcmp(secret, f->secret) != 0) {
+            nsimaj_log_warn("hello rejected bad_secret from %s", a->ip);
             struct json_buf b;
             json_buf_init(&b, 256);
             json_buf_printf(&b, "{");
@@ -580,6 +725,8 @@ int fleet_handle_message(struct fleet *f, struct agent *a, const char *json)
         a->last_seen = util_now();
         fleet_touch(f);
         fleet_set_status(f, "Agent online: %s (%s)", a->hostname, a->ip);
+        nsimaj_log_info("agent online host=%s ip=%s id=%s queued=%d",
+                        a->hostname, a->ip, a->id, a->queue_len);
 
         struct json_buf b;
         json_buf_init(&b, 256);
@@ -587,6 +734,7 @@ int fleet_handle_message(struct fleet *f, struct agent *a, const char *json)
         json_buf_add_str(&b, "type", MSG_OK);
         send_json(a, &b);
         json_buf_free(&b);
+        fleet_flush_queue(f, a);
         return merged ? 2 : 0;
     }
 
@@ -630,8 +778,21 @@ int fleet_handle_message(struct fleet *f, struct agent *a, const char *json)
             else
                 fleet_set_status(f, "Failed on %s (exit %ld)", a->hostname,
                                  a->job_exit);
+            nsimaj_log_error("job failed host=%s job=%s exit=%ld err=%s",
+                             a->hostname, a->job_id, a->job_exit,
+                             a->last_error[0] ? a->last_error : "-");
+            fleet_flush_queue(f, a);
         } else if (strcmp(a->job_stage, STAGE_DONE) == 0) {
+            if (strcmp(a->job_kind, JOB_KIND_UPDATE) == 0)
+                a->last_update_at = util_now();
             fleet_set_status(f, "Done on %s — update finished OK", a->hostname);
+            nsimaj_log_info("job done host=%s job=%s kind=%s", a->hostname,
+                            a->job_id, a->job_kind);
+            fleet_flush_queue(f, a);
+        } else if (strcmp(a->job_stage, STAGE_CANCELLED) == 0) {
+            nsimaj_log_info("job cancelled host=%s job=%s", a->hostname,
+                            a->job_id);
+            fleet_flush_queue(f, a);
         } else if (strcmp(a->job_stage, "installing_agent") == 0) {
             fleet_set_status(f, "%s: refreshing agent binary…", a->hostname);
         } else if (strcmp(a->job_stage, STAGE_UPGRADING) == 0) {
@@ -666,66 +827,65 @@ int fleet_handle_message(struct fleet *f, struct agent *a, const char *json)
 int fleet_start_job(struct fleet *f, const char *kind, const char *payload)
 {
     int started = 0;
-    char job_id[NSIMAJ_ID_LEN];
-    util_gen_id(job_id, sizeof job_id);
+    int queued = 0;
+    int selected = fleet_selected_count(f) > 0;
 
     for (int i = 0; i < NSIMAJ_MAX_AGENTS; i++) {
         struct agent *a = &f->agents[i];
-        if (!a->used || !a->online || !a->authenticated)
+        if (!a->used || !a->authenticated)
             continue;
-        if (fleet_selected_count(f) > 0 && !f->selected[i])
+        if (selected && !f->selected[i])
             continue;
 
-        struct json_buf b;
-        if (json_buf_init(&b, 1024) < 0)
-            continue;
-        json_buf_printf(&b, "{");
-        json_buf_add_str(&b, "type", MSG_JOB_START);
-        json_buf_add_str(&b, "job_id", job_id);
-        json_buf_add_str(&b, "kind", kind);
-        if (payload && payload[0])
-            json_buf_add_str(&b, "payload", payload);
-        if (json_buf_printf(&b, "}") < 0) {
-            json_buf_free(&b);
+        if (!a->online || fleet_agent_job_busy(a)) {
+            if (queue_enqueue(a, kind, payload) == 0) {
+                queued++;
+                snprintf(a->job_stage, sizeof a->job_stage, "%s", STAGE_QUEUED);
+                nsimaj_log_info("job queued host=%s kind=%s pending=%d online=%d",
+                                a->hostname, kind, a->queue_len, a->online);
+            } else {
+                nsimaj_log_warn("queue full host=%s kind=%s", a->hostname, kind);
+                fleet_set_status(f, "Queue full on %s", a->hostname);
+            }
             continue;
         }
-        if (frame_send_str(a->fd, b.data) == 0) {
-            snprintf(a->job_id, sizeof a->job_id, "%s", job_id);
-            snprintf(a->job_kind, sizeof a->job_kind, "%s", kind);
-            snprintf(a->job_stage, sizeof a->job_stage, "%s", STAGE_QUEUED);
-            a->job_exit = -1;
-            a->last_error[0] = '\0';
+
+        char job_id[NSIMAJ_ID_LEN];
+        util_gen_id(job_id, sizeof job_id);
+        if (dispatch_job_to_agent(f, a, kind, payload, job_id) == 0)
             started++;
-        } else {
-            snprintf(a->last_error, sizeof a->last_error, "send failed");
-            snprintf(a->job_stage, sizeof a->job_stage, "%s", STAGE_FAILED);
-            fleet_set_status(f, "Send failed to %s", a->hostname);
-        }
-        json_buf_free(&b);
     }
 
     char hist[256];
-    snprintf(hist, sizeof hist, "dispatch kind=%s job=%s hosts=%d", kind, job_id,
-             started);
+    snprintf(hist, sizeof hist, "dispatch kind=%s started=%d queued=%d", kind,
+             started, queued);
     fleet_save_history(f, hist);
-    if (started > 0)
-        fleet_set_status(f, "Started %s on %d host(s) [%s]", kind, started,
-                         job_id);
+    if (started > 0 || queued > 0)
+        fleet_set_status(f, "Started %s on %d host(s), queued %d", kind, started,
+                         queued);
     else
-        fleet_set_status(f, "No hosts reached for %s", kind);
-    return started;
+        fleet_set_status(f, "No hosts for %s", kind);
+    nsimaj_log_info("dispatch kind=%s started=%d queued=%d", kind, started,
+                    queued);
+    return started + queued;
 }
 
 int fleet_cancel_jobs(struct fleet *f)
 {
     int n = 0;
+    int cleared = 0;
+    int selected = fleet_selected_count(f) > 0;
     for (int i = 0; i < NSIMAJ_MAX_AGENTS; i++) {
         struct agent *a = &f->agents[i];
-        if (!a->used || !a->online || !a->authenticated)
+        if (!a->used || !a->authenticated)
             continue;
-        if (!a->job_id[0])
+        if (selected && !f->selected[i])
             continue;
-        if (fleet_selected_count(f) > 0 && !f->selected[i])
+        if (a->queue_len > 0) {
+            cleared += a->queue_len;
+            fleet_queue_clear(a);
+        }
+        if (!a->online || !a->job_id[0] || !fleet_agent_job_busy(a))
             continue;
         struct json_buf b;
         json_buf_init(&b, 256);
@@ -737,7 +897,9 @@ int fleet_cancel_jobs(struct fleet *f)
             n++;
         json_buf_free(&b);
     }
-    fleet_set_status(f, "Cancel sent to %d host(s)", n);
+    fleet_set_status(f, "Cancel sent to %d host(s), cleared %d queued", n,
+                     cleared);
+    nsimaj_log_info("cancel sent=%d queue_cleared=%d", n, cleared);
     return n;
 }
 
@@ -746,22 +908,29 @@ int fleet_focus(struct fleet *f, int index)
     if (index < 0 || index >= NSIMAJ_MAX_AGENTS)
         return -1;
     struct agent *a = &f->agents[index];
-    if (!a->used || !a->online || !a->authenticated)
+    if (!a->used || !a->online || !a->authenticated) {
+        nsimaj_log_warn("focus refused host=%s online=%d auth=%d",
+                        a->used ? a->hostname : "?", a->online,
+                        a->authenticated);
+        fleet_set_status(f, "Cannot focus: agent offline or missing");
         return -1;
-    if (!a->job_id[0]) {
-        fleet_set_status(f, "No active job on %s — starting a shell session tag",
-                         a->hostname);
     }
 
     char job_id[NSIMAJ_ID_LEN];
-    if (a->job_id[0])
+    /* Reattach running job; if finished/idle, open a fresh shell tmux. */
+    if (a->job_id[0] && fleet_agent_job_busy(a)) {
         snprintf(job_id, sizeof job_id, "%s", a->job_id);
-    else {
+        nsimaj_log_info("focus attach existing job host=%s job=%s", a->hostname,
+                        job_id);
+    } else {
         util_gen_id(job_id, sizeof job_id);
         snprintf(a->job_id, sizeof a->job_id, "%s", job_id);
         snprintf(a->job_kind, sizeof a->job_kind, "%s", JOB_KIND_EXEC);
         snprintf(a->job_stage, sizeof a->job_stage, "%s", STAGE_RUNNING);
-        /* Ask agent to start an interactive shell job if none */
+        a->job_exit = -1;
+        a->last_error[0] = '\0';
+        fleet_set_status(f, "Starting shell on %s…", a->hostname);
+        nsimaj_log_info("focus start shell host=%s job=%s", a->hostname, job_id);
         struct json_buf jb;
         json_buf_init(&jb, 512);
         json_buf_printf(&jb, "{");
@@ -770,10 +939,15 @@ int fleet_focus(struct fleet *f, int index)
         json_buf_add_str(&jb, "kind", JOB_KIND_EXEC);
         json_buf_add_str(&jb, "payload", "bash");
         json_buf_printf(&jb, "}");
-        frame_send_str(a->fd, jb.data);
+        if (frame_send_str(a->fd, jb.data) < 0) {
+            json_buf_free(&jb);
+            nsimaj_log_error("focus job_start send failed host=%s", a->hostname);
+            fleet_set_status(f, "Focus failed: could not start shell on %s",
+                             a->hostname);
+            return -1;
+        }
         json_buf_free(&jb);
-        /* Give the agent a moment to create the tmux session before attach */
-        util_sleep_ms(400);
+        util_sleep_ms(500);
     }
 
     struct json_buf b;
@@ -784,6 +958,8 @@ int fleet_focus(struct fleet *f, int index)
     json_buf_printf(&b, "}");
     if (frame_send_str(a->fd, b.data) < 0) {
         json_buf_free(&b);
+        nsimaj_log_error("focus_start send failed host=%s", a->hostname);
+        fleet_set_status(f, "Focus failed: send error to %s", a->hostname);
         return -1;
     }
     json_buf_free(&b);

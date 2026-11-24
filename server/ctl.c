@@ -139,33 +139,36 @@ void ctl_push_state(struct ctl_server *c, struct fleet *f)
     json_buf_add_int(&b, "online", fleet_online_count(f));
     json_buf_add_int(&b, "confirm", f->confirm_pending);
 
-    int n = 0;
-    for (int i = 0; i < NSIMAJ_MAX_AGENTS; i++) {
+    int idxs[NSIMAJ_MAX_AGENTS];
+    int n = fleet_visible_sorted(f, idxs, NSIMAJ_MAX_AGENTS);
+    for (int vi = 0; vi < n; vi++) {
+        int i = idxs[vi];
         struct agent *a = &f->agents[i];
-        if (!a->used || !a->authenticated)
-            continue;
         char k[32];
-        snprintf(k, sizeof k, "id%d", n);
+        snprintf(k, sizeof k, "id%d", vi);
         json_buf_add_str(&b, k, a->id);
-        snprintf(k, sizeof k, "host%d", n);
+        snprintf(k, sizeof k, "host%d", vi);
         json_buf_add_str(&b, k, a->hostname);
-        snprintf(k, sizeof k, "ip%d", n);
+        snprintf(k, sizeof k, "ip%d", vi);
         json_buf_add_str(&b, k, a->ip);
-        snprintf(k, sizeof k, "distro%d", n);
+        snprintf(k, sizeof k, "distro%d", vi);
         json_buf_add_str(&b, k, a->distro);
-        snprintf(k, sizeof k, "stage%d", n);
+        snprintf(k, sizeof k, "stage%d", vi);
         json_buf_add_str(&b, k, a->job_stage[0] ? a->job_stage : "-");
-        snprintf(k, sizeof k, "err%d", n);
+        snprintf(k, sizeof k, "err%d", vi);
         json_buf_add_str(&b, k, a->last_error);
-        snprintf(k, sizeof k, "on%d", n);
+        snprintf(k, sizeof k, "on%d", vi);
         json_buf_add_int(&b, k, a->online);
-        snprintf(k, sizeof k, "upd%d", n);
+        snprintf(k, sizeof k, "upd%d", vi);
         json_buf_add_int(&b, k, a->pending_updates);
-        snprintf(k, sizeof k, "sel%d", n);
+        snprintf(k, sizeof k, "sel%d", vi);
         json_buf_add_int(&b, k, f->selected[i] ? 1 : 0);
-        snprintf(k, sizeof k, "slot%d", n);
+        snprintf(k, sizeof k, "slot%d", vi);
         json_buf_add_int(&b, k, i);
-        n++;
+        snprintf(k, sizeof k, "last%d", vi);
+        json_buf_add_int(&b, k, a->last_update_at);
+        snprintf(k, sizeof k, "q%d", vi);
+        json_buf_add_int(&b, k, a->queue_len);
     }
     json_buf_add_int(&b, "n", n);
     json_buf_printf(&b, "}");
@@ -200,15 +203,11 @@ void ctl_send_focus_data(struct ctl_server *c, const unsigned char *data,
 
 static int visible_slot(struct fleet *f, int nth)
 {
-    int seen = 0;
-    for (int i = 0; i < NSIMAJ_MAX_AGENTS; i++) {
-        if (!f->agents[i].used || !f->agents[i].authenticated)
-            continue;
-        if (seen == nth)
-            return i;
-        seen++;
-    }
-    return -1;
+    int idxs[NSIMAJ_MAX_AGENTS];
+    int n = fleet_visible_sorted(f, idxs, NSIMAJ_MAX_AGENTS);
+    if (nth < 0 || nth >= n)
+        return -1;
+    return idxs[nth];
 }
 
 static void handle_ctl_msg(struct ctl_server *c, struct fleet *f,

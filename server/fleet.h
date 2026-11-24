@@ -6,6 +6,14 @@
 
 #include <stddef.h>
 
+#define NSIMAJ_QUEUE_PAYLOAD 512
+
+struct pending_job {
+    char kind[32];
+    char payload[NSIMAJ_QUEUE_PAYLOAD];
+    long queued_at;
+};
+
 struct agent {
     int fd;
     int used;
@@ -24,7 +32,11 @@ struct agent {
     long job_exit;
     char last_error[256];
     long last_seen;
+    long last_update_at; /* epoch when last update job reached done */
     int focusing;
+    int queue_len;
+    int queue_head; /* ring index of next to dequeue */
+    struct pending_job queue[NSIMAJ_QUEUE_CAP];
     struct frame_reader reader;
 };
 
@@ -71,6 +83,12 @@ void fleet_disconnect(struct fleet *f, struct agent *a);
 int fleet_online_count(const struct fleet *f);
 void fleet_clear_selection(struct fleet *f);
 int fleet_selected_count(const struct fleet *f);
+
+/* Fill idxs with agent slot indices sorted by hostname. Returns count. */
+int fleet_visible_sorted(struct fleet *f, int *idxs, int max);
+int fleet_agent_job_busy(const struct agent *a);
+void fleet_queue_clear(struct agent *a);
+int fleet_flush_queue(struct fleet *f, struct agent *a);
 
 int fleet_handle_message(struct fleet *f, struct agent *a, const char *json);
 int fleet_start_job(struct fleet *f, const char *kind, const char *payload);

@@ -4,6 +4,7 @@
 #include "state.h"
 
 #include "../common/json.h"
+#include "../common/log.h"
 #include "../common/util.h"
 
 #include <errno.h>
@@ -21,7 +22,7 @@
 
 const char *agent_tmux_name(const char *job_id, char *buf, size_t sz)
 {
-    snprintf(buf, sz, "nsimaj-%s", job_id);
+    snprintf(buf, sz, "nsimajs-%s", job_id);
     /* tmux session names: sanitize */
     for (char *p = buf; *p; p++) {
         if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
@@ -367,24 +368,41 @@ int agent_focus_start(struct agent_state *st, const char *job_id)
     char log_path[256];
     snprintf(log_path, sizeof log_path, "/tmp/nsimaj-log-%s", session);
 
-    /* Wait briefly for job_start to create the session */
+    /* Wait for job_start to create the session (up to ~10s). */
     int use_tmux = 0;
-    if (run_cmd("command -v tmux >/dev/null 2>&1") == 0) {
+    int have_tmux = (run_cmd("command -v tmux >/dev/null 2>&1") == 0);
+    if (have_tmux) {
         char check[256];
         snprintf(check, sizeof check, "tmux has-session -t %s 2>/dev/null",
                  session);
-        for (int i = 0; i < 20; i++) {
+        for (int i = 0; i < 100; i++) {
             if (run_cmd(check) == 0) {
                 use_tmux = 1;
                 break;
             }
             util_sleep_ms(100);
         }
+        /* No existing session: create an interactive shell so focus always works. */
+        if (!use_tmux) {
+            char create[512];
+            snprintf(create, sizeof create,
+                     "TERM=xterm-256color tmux new-session -d -s %s -x 120 -y 40 -- "
+                     "/bin/bash -l",
+                     session);
+            if (run_cmd(create) == 0) {
+                use_tmux = 1;
+                nsimaj_log_info("focus created shell tmux session %s", session);
+            } else {
+                nsimaj_log_warn("focus could not create tmux session %s", session);
+            }
+        }
     }
 
     int mfd = open("/dev/ptmx", O_RDWR | O_NOCTTY);
-    if (mfd < 0)
+    if (mfd < 0) {
+        nsimaj_log_error("focus open /dev/ptmx failed: %s", strerror(errno));
         return -1;
+    }
     if (grantpt(mfd) < 0 || unlockpt(mfd) < 0) {
         close(mfd);
         return -1;
@@ -425,7 +443,7 @@ int agent_focus_start(struct agent_state *st, const char *job_id)
         /* No session: follow log with a clear banner (never leave a blank PTY) */
         execlp("sh", "sh", "-c",
                "export TERM=xterm-256color; "
-               "printf '\\r\\n[nsimaj] no tmux session — showing job log "
+               "printf '\\r\\n[nsimajs] no tmux session — showing job log "
                "(Ctrl-N to detach)\\r\\n\\r\\n'; "
                "touch \"$1\"; "
                "if [ ! -s \"$1\" ]; then "
@@ -434,6 +452,7 @@ int agent_focus_start(struct agent_state *st, const char *job_id)
                "sh", log_path, (char *)NULL);
         _exit(127);
     }
+    nsimaj_log_info("focus attached session=%s tmux=%d", session, use_tmux);
 
     st->focus_pty = mfd;
     st->focus_pid = pid;

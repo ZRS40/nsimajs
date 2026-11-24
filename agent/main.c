@@ -5,6 +5,7 @@
 
 #include "../common/frame.h"
 #include "../common/json.h"
+#include "../common/log.h"
 #include "../common/util.h"
 #include "../protocol/protocol.h"
 
@@ -309,6 +310,12 @@ int main(int argc, char **argv)
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
     signal(SIGPIPE, SIG_IGN);
+
+    if (nsimaj_log_open("/var/log/nsimaj-agent.log") < 0)
+        nsimaj_log_open("/tmp/nsimaj-agent.log");
+    nsimaj_log_info("agent start v%s host=%s family=%s -> %s:%d",
+                    NSIMAJ_VERSION, st.hostname, st.family, st.server_host,
+                    st.server_port);
 
     fprintf(stderr, "nsimaj-agent %s host=%s family=%s -> %s:%d\n",
             NSIMAJ_VERSION, st.hostname, st.family, st.server_host,

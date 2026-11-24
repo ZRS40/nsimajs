@@ -8,7 +8,8 @@ ifneq ($(GIT_VERSION),)
 CFLAGS += -DNSIMAJ_VERSION=\"$(GIT_VERSION)\"
 endif
 
-COMMON_SRC = common/frame.c common/json.c common/util.c common/firewall.c
+COMMON_SRC = common/frame.c common/json.c common/util.c common/firewall.c \
+	common/log.c
 SERVER_SRC = server/main.c server/fleet.c server/http.c server/tui.c \
 	server/selfupdate.c server/ctl.c server/client.c $(COMMON_SRC)
 AGENT_SRC  = agent/main.c agent/jobs.c agent/osinfo.c $(COMMON_SRC)
